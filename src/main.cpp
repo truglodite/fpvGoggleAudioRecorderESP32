@@ -68,7 +68,7 @@ volatile LedMode ledMode = LED_BOOT;
 volatile uint32_t globalPeak = 0;
 volatile uint32_t lastAudioMs = 0;
 volatile uint32_t core1Heartbeat = 0;
-volatile uint32_t lastButtonPressMs = 0; // Tracks non-blocking UI flash timing
+volatile uint32_t lastFileSplitMs = 0; // Tracks both manual and auto splits
 
 volatile bool fatalState = false;
 volatile bool sdWarning = false;
@@ -82,22 +82,16 @@ volatile bool limiterActive = false;
 Freenove_ESP32_WS2812 statusLED(1, RGB_LED_PIN, 0, TYPE_GRB);
 
 // ======================================================
-// DUAL-CORE AUDIO RING BUFFER STRUCTURES
+// OS-MANAGED DUAL-CORE AUDIO RING POOL (THREAD-SAFE)
 // ======================================================
-
-enum BlockState : uint8_t {
-    BLOCK_FREE = 0,
-    BLOCK_FILLED = 1
-};
 
 struct AudioBlock {
     int32_t samples[BLOCK_SAMPLES]; 
-    volatile BlockState state;
 };
 
 AudioBlock queueBuffer[QUEUE_BLOCKS];
-volatile uint16_t writeIndex = 0;
-volatile uint16_t readIndex  = 0;
+QueueHandle_t freeBlockQueue = NULL;
+QueueHandle_t filledBlockQueue = NULL;
 
 // ======================================================
 // FILE I/O AND MEDIA SYSTEM DEFINITIONS
@@ -122,7 +116,7 @@ SystemHealth sys;
 TaskHandle_t AudioCoreTaskHandle = NULL;
 
 // ======================================================
-// UPGRADED FPU DSP COMPRESSOR SYSTEM (DUAL-TRACKER)
+// UPGRADED FPU DSP COMPRESSOR SYSTEM STATES
 // ======================================================
 
 struct DSPState { 
@@ -132,64 +126,7 @@ struct DSPState {
     float env;       // Final output tracker for LED
 };
 
-// Initialize the DSP state global variable with all four tracks
 DSPState dsp = {0.0f, 0.0f, 0.0f, 0.0f};
-
-inline int32_t processSampleFPU24(int32_t sample, DSPState *state) {
-    // 1. Convert to 24-bit floating point range
-    int32_t shiftedSample = sample >> 8;
-    float x = (float)shiftedSample; 
-
-    // 2. High-Pass Filter / DC Offset Blocker
-    float hp = 0.995f * state->hp + x - state->prev;
-    state->prev = x;
-    state->hp = hp;
-    x = hp;
-
-    // 3. ISOLATED INPUT ENVELOPE TRACKING (Pure sidechain detection)
-    float rawAbs = fabsf(x);
-    if (rawAbs > state->inputEnv) {
-        state->inputEnv = 0.9f * state->inputEnv + 0.1f * rawAbs; // Fast attack
-    } else {
-        state->inputEnv *= 0.9995f; // Smooth release hold tailored for vocals
-    }
-
-    // 4. Convert Input Envelope to Decibels relative to 24-bit max (8388608.0)
-    float envdB = -100.0f;
-    if (state->inputEnv > 0.0f) {
-        envdB = 20.0f * log10f(state->inputEnv / 8388608.0f);
-    }
-
-    // 5. COMPRESSOR LOGIC (Aggressive Vocal Leveling)
-    const float thresholdDB = -45.0f; // Catches quiet whispers easily
-    const float ratio = 5.0f;          // 5:1 compression ratio
-    float gainReductionDB = 0.0f;
-
-    if (envdB > thresholdDB) {
-        gainReductionDB = (1.0f - (1.0f / ratio)) * (thresholdDB - envdB);
-    }
-
-    // 6. APPLY HEAVY MAKE-UP GAIN (+30dB)
-    // This dramatically lifts the volume of distant sounds when input is quiet
-    float totalGainDB = gainReductionDB + 30.0f;
-    float linearGain = powf(10.0f, totalGainDB / 20.0f);
-    x *= linearGain;
-
-    // 7. Safety Limiter Ceiling (Clamps to absolute maximum 24-bit boundaries)
-    const float maxLimit = 8300000.0f;
-    if (x > maxLimit)  x = maxLimit;
-    if (x < -maxLimit) x = -maxLimit;
-
-    // 8. FINAL OUTPUT ENVELOPE TRACKING (Feeds the LED driver cleanly)
-    float finalAbs = fabsf(x);
-    if (finalAbs > state->env) {
-        state->env = 0.9f * state->env + 0.1f * finalAbs; // Fast response for clipping
-    } else {
-        state->env *= 0.9998f;                             // Slow release hold
-    }
-
-    return (int32_t)x;
-}
 
 inline void updatePeak24(int32_t sample) {
     uint32_t a = abs(sample);
@@ -222,8 +159,7 @@ void updateLED() {
         rollingMax = currentEnv;
     }
 
-    // TRIGGER CHECK: If a sharp tap approaches the top 85% of our rolling max,
-    // or if it crosses an absolute minimum threshold (to prevent false alarms in dead silence)
+    // TRIGGER CHECK: If sharp transients approach the top 85% of our rolling max
     if (currentEnv > (rollingMax * 0.85f) && currentEnv > 500.0f) {
         redAlertExpiryMs = millis() + 500; // Force a 500ms Red hold
     }
@@ -262,15 +198,15 @@ void updateLED() {
         }
         
         case LED_RECORDING:
-            // Dynamic clipping indicator check
-            if (millis() < redAlertExpiryMs) {
-                statusLED.setLedColor(0, 255, 0, 0); // Solid Red on Tap!
-            } 
-            // Button Split Confirmation (Blue Flash)
-            else if ((millis() - lastButtonPressMs) < 200) {
+            // PRIORITY 1: New File Split Confirmation (600ms High-Visibility Hold)
+            if ((millis() - lastFileSplitMs) < 600) {
                 statusLED.setLedColor(0, 0, 0, 255); // Solid Blue
             } 
-            // Standard Heartbeat
+            // PRIORITY 2: Dynamic Clipping Indicator (Red Hold)
+            else if (millis() < redAlertExpiryMs) {
+                statusLED.setLedColor(0, 255, 0, 0); // Solid Red on Peak Tap!
+            } 
+            // PRIORITY 3: Standard Disk Activity Heartbeat
             else if ((millis() - lastAudioMs) < 250) {
                 if (millis() % 1000 < 150) {
                     statusLED.setLedColor(0, 0, 150, 0); // Bright Green Write Blip
@@ -344,6 +280,8 @@ void openSegment() {
     audioFile = SD.open(currentFilename, FILE_WRITE);
     if (!audioFile) fatalError();
     segmentStartMs = millis();
+    
+    lastFileSplitMs = millis(); // Trigger UI event on successful file creation
     logEvent("OPEN", currentFilename);
 }
 
@@ -355,18 +293,11 @@ void closeSegment() {
 }
 
 bool queueEmpty() {
-    for (int i = 0; i < QUEUE_BLOCKS; i++) {
-        if (queueBuffer[i].state == BLOCK_FILLED) return false;
-    }
-    return true;
+    return (uxQueueMessagesWaiting(filledBlockQueue) == 0);
 }
 
 uint32_t queueUsed() {
-    uint32_t count = 0;
-    for (int i = 0; i < QUEUE_BLOCKS; i++) {
-        if (queueBuffer[i].state == BLOCK_FILLED) count++;
-    }
-    return count;
+    return uxQueueMessagesWaiting(filledBlockQueue);
 }
 
 // ======================================================
@@ -384,9 +315,9 @@ void audioCoreTask(void *pvParameters) {
         }
 
         core1Heartbeat = millis();
-        AudioBlock &block = queueBuffer[writeIndex];
 
-        if (block.state == BLOCK_FILLED) {
+        AudioBlock *block = NULL;
+        if (xQueueReceive(freeBlockQueue, &block, 0) != pdTRUE) {
             sys.bufferOverruns++;
             bufferWarning = true;
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -397,25 +328,73 @@ void audioCoreTask(void *pvParameters) {
         
         if (err != ESP_OK || bytesRead == 0) {
             sys.i2sTimeouts++;
-            memset(block.samples, 0, sizeof(block.samples));
+            memset(block->samples, 0, sizeof(block->samples));
         } else {
             size_t totalSamples = bytesRead / sizeof(int32_t);
+            
+            // --- OPTIMIZED BLOCK-LEVEL SIDECHAIN DETECTION ---
+            float maxBlockVal = 0.0f;
+            for (size_t i = 0; i < totalSamples; i++) {
+                float s = fabsf((float)(rawSamples[i] >> 8));
+                if (s > maxBlockVal) maxBlockVal = s;
+            }
+
+            if (maxBlockVal > dsp.inputEnv) {
+                dsp.inputEnv = 0.6f * dsp.inputEnv + 0.4f * maxBlockVal; // Rapid attack
+            } else {
+                dsp.inputEnv *= 0.95f; // Release hold
+            }
+
+            float envdB = -100.0f;
+            if (dsp.inputEnv > 0.0f) {
+                envdB = 20.0f * log10f(dsp.inputEnv / 8388608.0f);
+            }
+
+            const float thresholdDB = -45.0f;
+            const float ratio = 5.0f;
+            float gainReductionDB = 0.0f;
+
+            if (envdB > thresholdDB) {
+                gainReductionDB = (1.0f - (1.0f / ratio)) * (thresholdDB - envdB);
+            }
+
+            float totalGainDB = gainReductionDB + 30.0f;
+            float blockLinearGain = powf(10.0f, totalGainDB / 20.0f);
+            // -------------------------------------------------
+
+            float maxProcessedBlockVal = 0.0f;
             for (size_t i = 0; i < BLOCK_SAMPLES; i++) {
                 if (i < totalSamples) {
-                    int32_t processed24 = processSampleFPU24(rawSamples[i], &dsp);
-                    block.samples[i] = processed24;
-                    updatePeak24(processed24);
+                    // Fast High-Pass/DC Filter
+                    float x = (float)(rawSamples[i] >> 8);
+                    float hp = 0.995f * dsp.hp + x - dsp.prev;
+                    dsp.prev = x;
+                    dsp.hp = hp;
+
+                    hp *= blockLinearGain;
+
+                    const float maxLimit = 8300000.0f;
+                    if (hp > maxLimit)  hp = maxLimit;
+                    if (hp < -maxLimit) hp = -maxLimit;
+
+                    block->samples[i] = (int32_t)hp;
+                    updatePeak24(block->samples[i]);
+
+                    // Capture true processed block peak for UI meter
+                    float absHp = fabsf(hp);
+                    if (absHp > maxProcessedBlockVal) {
+                        maxProcessedBlockVal = absHp;
+                    }
                 } else {
-                    block.samples[i] = 0; 
+                    block->samples[i] = 0; 
                 }
             }
+            
+            // Sync output tracker for the LED indicator state using true peak
+            dsp.env = 0.9f * dsp.env + 0.1f * maxProcessedBlockVal;
         }
 
-        portMEMORY_BARRIER();
-        block.state = BLOCK_FILLED;
-        portMEMORY_BARRIER();
-
-        writeIndex = (writeIndex + 1) % QUEUE_BLOCKS;
+        xQueueSend(filledBlockQueue, &block, 0);
         lastAudioMs = millis();
 
         if (queueUsed() < (QUEUE_BLOCKS / 2)) {
@@ -458,9 +437,8 @@ void writeTaskStep() {
         portMEMORY_BARRIER();
     }
 
-    AudioBlock &block = queueBuffer[readIndex];
-
-    if (block.state != BLOCK_FILLED) {
+    AudioBlock *block = NULL;
+    if (xQueueReceive(filledBlockQueue, &block, 0) != pdTRUE) {
         if (rolloverPending && queueEmpty()) {
             closeSegment();
             openSegment();
@@ -470,7 +448,7 @@ void writeTaskStep() {
         return;
     }
 
-    bool ok = writeAudioBlock24(block);
+    bool ok = writeAudioBlock24(*block);
     if (!ok) {
         sys.sdErrors++;
         sdWarning = true;
@@ -480,11 +458,7 @@ void writeTaskStep() {
         if (sys.sdErrors == 0) sdWarning = false;
     }
 
-    portMEMORY_BARRIER();
-    block.state = BLOCK_FREE;
-    portMEMORY_BARRIER();
-
-    readIndex = (readIndex + 1) % QUEUE_BLOCKS;
+    xQueueSend(freeBlockQueue, &block, 0);
 
     if ((millis() - lastFlush) > FLUSH_INTERVAL_MS) {
         if (audioFile) audioFile.flush();
@@ -518,10 +492,6 @@ void checkButton() {
             if (buttonState == LOW) {
                 if (recording && !rolloverPending) {
                     Serial.println(">>> MANUAL SPLIT REQUESTED <<<");
-                    
-                    // Log the time of the press to trigger a non-blocking UI change
-                    lastButtonPressMs = millis(); 
-                    
                     rolloverPending = true;
                     portMEMORY_BARRIER();
                 }
@@ -557,14 +527,28 @@ void setup() {
     
     statusLED.begin();
     statusLED.setBrightness(40); 
-    statusLED.setLedColor(0, 0, 0, 150); // Set to solid blue during setup
+    statusLED.setLedColor(0, 0, 0, 150); // Solid blue during setup
     
     pinMode(BUTTON_PIN, INPUT_PULLUP);
 
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    if (!SD.begin(SD_CS, SPI, 40000000)) { 
+    if (!SD.begin(SD_CS, SPI, 20000000)) { 
         Serial.println("SD Initialization Failed!");
         fatalError();
+    }
+
+    // Allocate FreeRTOS Queues
+    freeBlockQueue = xQueueCreate(QUEUE_BLOCKS, sizeof(AudioBlock*));
+    filledBlockQueue = xQueueCreate(QUEUE_BLOCKS, sizeof(AudioBlock*));
+    if (freeBlockQueue == NULL || filledBlockQueue == NULL) {
+        Serial.println("Queue Allocation Failed!");
+        fatalError();
+    }
+
+    // Populate Free Queue with working buffer pointer memory addresses
+    for (int i = 0; i < QUEUE_BLOCKS; i++) {
+        AudioBlock *ptr = &queueBuffer[i];
+        xQueueSend(freeBlockQueue, &ptr, 0);
     }
 
     i2s_config_t i2s_config = {
@@ -590,8 +574,6 @@ void setup() {
 
     if (i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL) != ESP_OK) fatalError();
     if (i2s_set_pin(I2S_NUM, &pin_config) != ESP_OK) fatalError();
-
-    for (int i = 0; i < QUEUE_BLOCKS; i++) queueBuffer[i].state = BLOCK_FREE;
 
     sessionId = loadSessionCounter();
     openManifest();
