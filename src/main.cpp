@@ -24,6 +24,58 @@
 #include <math.h>
 
 // ======================================================
+// DSP & AGC (AUTOMATIC GAIN CONTROL) CONFIGURATION
+// ======================================================
+
+// High-Pass Filter: Prevents wind/breath rumble from falsely triggering the compressor.
+// [Recommended Range: 0.980f to 0.995f]
+// - 0.995f (~35Hz cut): Good for general audio, but lets wind rumble through.
+// - 0.988f (~80Hz cut): Standard vocal mic cutoff. Blocks breath plosives.
+// - 0.980f (~140Hz cut): Extreme wind reduction, but makes voices sound "thin" or tinny.
+#define DSP_HPF_COEFF 0.988f 
+
+// Attack speed: How fast the system clamps down on your loud voice.
+// [Recommended Range: 0.5f to 0.99f]
+// - 0.99f: Instant brickwall. Catches every peak but can sound "clicky".
+// - 0.90f: Sweet spot for vocal limiting. Fast enough to stop clipping.
+// - 0.50f: Slow attack. Lets transients (claps, sharp yells) pass through and clip.
+#define DSP_ATTACK_COEFF 0.9f 
+
+// Release speed: How smoothly background pit conversations fade in after you stop talking.
+// [Recommended Range: 0.950f to 0.995f]
+// - 0.995f (~3-4 sec recovery): Very slow, broadcast-style smooth fade in.
+// - 0.985f (~1-2 sec recovery): Sweet spot. Background comes up naturally between sentences.
+// - 0.950f (~200ms recovery): Jarring. The background noise will "pump" aggressively between every word.
+#define DSP_RELEASE_COEFF 0.985f 
+
+// Threshold (dB): Audio levels above this are compressed down.
+// [Recommended Range: -50.0f to -20.0f]
+// - -20.0f: Acts as a standard peak limiter. Only affects your voice when you shout.
+// - -40.0f: Sweet spot for AGC. Squashes your normal voice down so makeup gain can lift the background.
+// - -50.0f: Extreme sensitivity. Will start compressing ambient room noise and hiss.
+#define DSP_COMP_THRESHOLD_DB -40.0f
+
+// Ratio: How aggressively the loud audio is squashed above the threshold.
+// [Recommended Range: 2.0f to 20.0f]
+// - 2.0f: Gentle leveling. Sounds very natural, but loud shouts might still clip.
+// - 5.0f: Standard AGC ratio. Keeps volume relatively flat.
+// - 20.0f: Hard brickwall limiting. Absolute volume ceiling, but can sound crushed/distorted.
+#define DSP_COMP_RATIO 5.0f
+
+// Makeup Gain (dB): The massive volume boost applied to the entire signal.
+// [Recommended Range: 10.0f to 40.0f]
+// - 10.0f: Subtle boost. Good if you only care about your own voice.
+// - 30.0f: Sweet spot. Pulls distant 10ft conversations up to sound like they are 2ft away.
+// - 40.0f: Extreme gain. Will make a silent field sound like a wall of static/white noise.
+#define DSP_MAKEUP_GAIN_DB 30.0f
+
+// Absolute brickwall limit to prevent 24-bit integer overflow/wrap-around.
+// [Recommended Range: 8000000.0f to 8388600.0f]
+// - Do not exceed 8388607.0f (Theoretical 24-bit max). 
+// - 8300000.0f leaves a tiny safety margin to prevent digital wrap-around (which sounds like an explosive pop).
+#define DSP_LIMIT_MAX 8300000.0f
+
+// ======================================================
 // SYSTEM CONFIGURATION
 // ======================================================
 
@@ -68,7 +120,7 @@ volatile LedMode ledMode = LED_BOOT;
 volatile uint32_t globalPeak = 0;
 volatile uint32_t lastAudioMs = 0;
 volatile uint32_t core1Heartbeat = 0;
-volatile uint32_t lastFileSplitMs = 0; // Tracks both manual and auto splits
+volatile uint32_t lastFileSplitMs = 0; 
 
 volatile bool fatalState = false;
 volatile bool sdWarning = false;
@@ -78,11 +130,10 @@ volatile bool recording = false;
 volatile bool rolloverPending = false;
 volatile bool limiterActive = false;
 
-// Hardware RMT Peripheral Token Instance
 Freenove_ESP32_WS2812 statusLED(1, RGB_LED_PIN, 0, TYPE_GRB);
 
 // ======================================================
-// OS-MANAGED DUAL-CORE AUDIO RING POOL (THREAD-SAFE)
+// OS-MANAGED DUAL-CORE AUDIO RING POOL
 // ======================================================
 
 struct AudioBlock {
@@ -115,15 +166,11 @@ SystemHealth sys;
 
 TaskHandle_t AudioCoreTaskHandle = NULL;
 
-// ======================================================
-// UPGRADED FPU DSP COMPRESSOR SYSTEM STATES
-// ======================================================
-
 struct DSPState { 
-    float hp;        // High-pass filter history
-    float prev;      // DC blocker history
-    float inputEnv;  // Dedicated raw input tracker for compressor sidechain
-    float env;       // Final output tracker for LED
+    float hp;        
+    float prev;      
+    float inputEnv;  
+    float env;       
 };
 
 DSPState dsp = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -136,7 +183,7 @@ inline void updatePeak24(int32_t sample) {
 }
 
 // ======================================================
-// LIGHTWEIGHT UI DRIVER (Corrected Color Matrix Parameters)
+// LIGHTWEIGHT UI DRIVER
 // ======================================================
 
 void updateLED() {
@@ -145,23 +192,19 @@ void updateLED() {
     lastUpdate = millis();
 
     static uint32_t redAlertExpiryMs = 0;
-    static float rollingMax = 100.0f; // Dynamic volume ceiling tracker
+    static float rollingMax = 100.0f; 
     
-    // Decay the rolling maximum slowly over time so it stays sensitive
     rollingMax *= 0.995f; 
     if (rollingMax < 100.0f) rollingMax = 100.0f;
 
-    // Capture the current envelope value from the DSP engine
     float currentEnv = dsp.env;
 
-    // Update our auto-calibration benchmark if we find a new hardware peak
     if (currentEnv > rollingMax) {
         rollingMax = currentEnv;
     }
 
-    // TRIGGER CHECK: If sharp transients approach the top 85% of our rolling max
     if (currentEnv > (rollingMax * 0.85f) && currentEnv > 500.0f) {
-        redAlertExpiryMs = millis() + 500; // Force a 500ms Red hold
+        redAlertExpiryMs = millis() + 500; 
     }
 
     if (fatalState || diskFull) {
@@ -174,13 +217,13 @@ void updateLED() {
 
     switch (ledMode) {
         case LED_BOOT:
-            statusLED.setLedColor(0, 0, 0, 150); // Solid Blue
+            statusLED.setLedColor(0, 0, 0, 150);
             break;
             
         case LED_FATAL: {
             static bool toggle = false;
             toggle = !toggle;
-            if (toggle) statusLED.setLedColor(0, 255, 0, 0); // Flashing Red
+            if (toggle) statusLED.setLedColor(0, 255, 0, 0); 
             else statusLED.setLedColor(0, 0, 0, 0);
             break;
         }
@@ -191,30 +234,27 @@ void updateLED() {
                 slowToggle = 0;
                 static bool wToggle = false;
                 wToggle = !wToggle;
-                if (wToggle) statusLED.setLedColor(0, 200, 100, 0); // Pulsing Orange
+                if (wToggle) statusLED.setLedColor(0, 200, 100, 0); 
                 else statusLED.setLedColor(0, 0, 0, 0);
             }
             break;
         }
         
         case LED_RECORDING:
-            // PRIORITY 1: New File Split Confirmation (600ms High-Visibility Hold)
             if ((millis() - lastFileSplitMs) < 600) {
-                statusLED.setLedColor(0, 0, 0, 255); // Solid Blue
+                statusLED.setLedColor(0, 0, 0, 255); 
             } 
-            // PRIORITY 2: Dynamic Clipping Indicator (Red Hold)
             else if (millis() < redAlertExpiryMs) {
-                statusLED.setLedColor(0, 255, 0, 0); // Solid Red on Peak Tap!
+                statusLED.setLedColor(0, 255, 0, 0); 
             } 
-            // PRIORITY 3: Standard Disk Activity Heartbeat
             else if ((millis() - lastAudioMs) < 250) {
                 if (millis() % 1000 < 150) {
-                    statusLED.setLedColor(0, 0, 150, 0); // Bright Green Write Blip
+                    statusLED.setLedColor(0, 0, 150, 0); 
                 } else {
-                    statusLED.setLedColor(0, 0, 20, 0);  // Dim Green Heartbeat
+                    statusLED.setLedColor(0, 0, 20, 0);  
                 }
             } else {
-                statusLED.setLedColor(0, 50, 0, 50);     // Purple if Mic drops trace
+                statusLED.setLedColor(0, 50, 0, 50);     
             }
             break;
     }
@@ -281,7 +321,7 @@ void openSegment() {
     if (!audioFile) fatalError();
     segmentStartMs = millis();
     
-    lastFileSplitMs = millis(); // Trigger UI event on successful file creation
+    lastFileSplitMs = millis();
     logEvent("OPEN", currentFilename);
 }
 
@@ -332,7 +372,7 @@ void audioCoreTask(void *pvParameters) {
         } else {
             size_t totalSamples = bytesRead / sizeof(int32_t);
             
-            // --- OPTIMIZED BLOCK-LEVEL SIDECHAIN DETECTION ---
+            // --- OPTIMIZED AGC/COMPRESSOR SIDECHAIN ---
             float maxBlockVal = 0.0f;
             for (size_t i = 0; i < totalSamples; i++) {
                 float s = fabsf((float)(rawSamples[i] >> 8));
@@ -340,9 +380,11 @@ void audioCoreTask(void *pvParameters) {
             }
 
             if (maxBlockVal > dsp.inputEnv) {
-                dsp.inputEnv = 0.6f * dsp.inputEnv + 0.4f * maxBlockVal; // Rapid attack
+                // Fast attack to catch loud peaks
+                dsp.inputEnv = (1.0f - DSP_ATTACK_COEFF) * dsp.inputEnv + DSP_ATTACK_COEFF * maxBlockVal; 
             } else {
-                dsp.inputEnv *= 0.95f; // Release hold
+                // Slow release to fade in background noise
+                dsp.inputEnv *= DSP_RELEASE_COEFF; 
             }
 
             float envdB = -100.0f;
@@ -350,37 +392,34 @@ void audioCoreTask(void *pvParameters) {
                 envdB = 20.0f * log10f(dsp.inputEnv / 8388608.0f);
             }
 
-            const float thresholdDB = -45.0f;
-            const float ratio = 5.0f;
             float gainReductionDB = 0.0f;
-
-            if (envdB > thresholdDB) {
-                gainReductionDB = (1.0f - (1.0f / ratio)) * (thresholdDB - envdB);
+            if (envdB > DSP_COMP_THRESHOLD_DB) {
+                gainReductionDB = (1.0f - (1.0f / DSP_COMP_RATIO)) * (DSP_COMP_THRESHOLD_DB - envdB);
             }
 
-            float totalGainDB = gainReductionDB + 30.0f;
+            float totalGainDB = gainReductionDB + DSP_MAKEUP_GAIN_DB;
             float blockLinearGain = powf(10.0f, totalGainDB / 20.0f);
-            // -------------------------------------------------
+            // ------------------------------------------
 
             float maxProcessedBlockVal = 0.0f;
             for (size_t i = 0; i < BLOCK_SAMPLES; i++) {
                 if (i < totalSamples) {
-                    // Fast High-Pass/DC Filter
                     float x = (float)(rawSamples[i] >> 8);
-                    float hp = 0.995f * dsp.hp + x - dsp.prev;
+                    
+                    // High-Pass Filter using defined coefficient
+                    float hp = DSP_HPF_COEFF * dsp.hp + x - dsp.prev;
                     dsp.prev = x;
                     dsp.hp = hp;
 
                     hp *= blockLinearGain;
 
-                    const float maxLimit = 8300000.0f;
-                    if (hp > maxLimit)  hp = maxLimit;
-                    if (hp < -maxLimit) hp = -maxLimit;
+                    // Brickwall limiter
+                    if (hp > DSP_LIMIT_MAX)  hp = DSP_LIMIT_MAX;
+                    if (hp < -DSP_LIMIT_MAX) hp = -DSP_LIMIT_MAX;
 
                     block->samples[i] = (int32_t)hp;
                     updatePeak24(block->samples[i]);
 
-                    // Capture true processed block peak for UI meter
                     float absHp = fabsf(hp);
                     if (absHp > maxProcessedBlockVal) {
                         maxProcessedBlockVal = absHp;
@@ -390,7 +429,6 @@ void audioCoreTask(void *pvParameters) {
                 }
             }
             
-            // Sync output tracker for the LED indicator state using true peak
             dsp.env = 0.9f * dsp.env + 0.1f * maxProcessedBlockVal;
         }
 
@@ -404,7 +442,7 @@ void audioCoreTask(void *pvParameters) {
 }
 
 // ======================================================
-// DISK WRITER SEQUENCER ENGINE (PACKS 32-BIT TO TRUE 24-BIT)
+// DISK WRITER SEQUENCER ENGINE
 // ======================================================
 
 bool writeAudioBlock24(AudioBlock &block) {
@@ -527,7 +565,7 @@ void setup() {
     
     statusLED.begin();
     statusLED.setBrightness(40); 
-    statusLED.setLedColor(0, 0, 0, 150); // Solid blue during setup
+    statusLED.setLedColor(0, 0, 0, 150); 
     
     pinMode(BUTTON_PIN, INPUT_PULLUP);
 
@@ -537,7 +575,6 @@ void setup() {
         fatalError();
     }
 
-    // Allocate FreeRTOS Queues
     freeBlockQueue = xQueueCreate(QUEUE_BLOCKS, sizeof(AudioBlock*));
     filledBlockQueue = xQueueCreate(QUEUE_BLOCKS, sizeof(AudioBlock*));
     if (freeBlockQueue == NULL || filledBlockQueue == NULL) {
@@ -545,7 +582,6 @@ void setup() {
         fatalError();
     }
 
-    // Populate Free Queue with working buffer pointer memory addresses
     for (int i = 0; i < QUEUE_BLOCKS; i++) {
         AudioBlock *ptr = &queueBuffer[i];
         xQueueSend(freeBlockQueue, &ptr, 0);
