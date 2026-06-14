@@ -34,31 +34,31 @@
 // - 0.980f (~140Hz cut): Extreme wind reduction, but makes voices sound "thin" or tinny.
 #define DSP_HPF_COEFF 0.988f 
 
-// Attack speed: How fast the system clamps down on your loud voice.
-// [Recommended Range: 0.5f to 0.99f]
-// - 0.99f: Instant brickwall. Catches every peak but can sound "clicky".
-// - 0.90f: Sweet spot for vocal limiting. Fast enough to stop clipping.
-// - 0.50f: Slow attack. Lets transients (claps, sharp yells) pass through and clip.
-#define DSP_ATTACK_COEFF 0.9f 
+// Attack Speed (True Alpha): How fast the system clamps down on sudden loud peaks.
+// [Recommended Range: 0.500f (Slower) to 0.990f (Brickwall)]
+// - 0.990f: Instant clamping. Catches aggressive transients but can sound slightly clicky.
+// - 0.900f: Sweet spot for vocal limiting. Fast enough to prevent clipping without artifacts.
+// - 0.500f: Relaxed attack. Lets quick claps or sharp shouts pass through uncompressed.
+#define DSP_ATTACK_COEFF 0.900f 
 
-// Release speed: How smoothly background pit conversations fade in after you stop talking.
-// [Recommended Range: 0.950f to 0.995f]
-// - 0.995f (~3-4 sec recovery): Very slow, broadcast-style smooth fade in.
-// - 0.985f (~1-2 sec recovery): Sweet spot. Background comes up naturally between sentences.
-// - 0.950f (~200ms recovery): Jarring. The background noise will "pump" aggressively between every word.
-#define DSP_RELEASE_COEFF 0.985f 
+// Release Speed (True Alpha): How smoothly volume fades back up to capture background noise.
+// [Recommended Range: 0.005f (Very Slow) to 0.050f (Very Fast)]
+// - 0.005f (~3-4 sec recovery): Slow, professional broadcast-style level gliding.
+// - 0.015f (~1-2 sec recovery): Sweet spot. Background tracks up naturally between spoken sentences.
+// - 0.050f (~200ms recovery): Fast pumping. Background environment noise rushes up between individual words.
+#define DSP_RELEASE_COEFF 0.015f 
 
 // Threshold (dB): Audio levels above this are compressed down.
 // [Recommended Range: -50.0f to -20.0f]
-// - -20.0f: Acts as a standard peak limiter. Only affects your voice when you shout.
+// - -20.0f: Standard peak limiter. Only affects your voice when you actively shout.
 // - -40.0f: Sweet spot for AGC. Squashes your normal voice down so makeup gain can lift the background.
-// - -50.0f: Extreme sensitivity. Will start compressing ambient room noise and hiss.
+// - -50.0f: Extreme sensitivity. Will start compressing ambient room noise and floor hiss.
 #define DSP_COMP_THRESHOLD_DB -40.0f
 
 // Ratio: How aggressively the loud audio is squashed above the threshold.
 // [Recommended Range: 2.0f to 20.0f]
 // - 2.0f: Gentle leveling. Sounds very natural, but loud shouts might still clip.
-// - 5.0f: Standard AGC ratio. Keeps volume relatively flat.
+// - 5.0f: Standard AGC ratio. Keeps vocal tracking relatively flat.
 // - 20.0f: Hard brickwall limiting. Absolute volume ceiling, but can sound crushed/distorted.
 #define DSP_COMP_RATIO 5.0f
 
@@ -73,7 +73,7 @@
 // [Recommended Range: 8000000.0f to 8388600.0f]
 // - Do not exceed 8388607.0f (Theoretical 24-bit max). 
 // - 8300000.0f leaves a tiny safety margin to prevent digital wrap-around (which sounds like an explosive pop).
-#define DSP_LIMIT_MAX 8300000.0f
+#define DSP_LIMIT_MAX 8300000.0f 
 
 // ======================================================
 // SYSTEM CONFIGURATION
@@ -176,7 +176,8 @@ struct DSPState {
 DSPState dsp = {0.0f, 0.0f, 0.0f, 0.0f};
 
 inline void updatePeak24(int32_t sample) {
-    uint32_t a = abs(sample);
+    // Fixed inner-out conversion: Cast to unsigned before negating to prevent INT32_MIN overflow
+    uint32_t a = (sample < 0) ? -(uint32_t)sample : (uint32_t)sample;
     uint32_t peak = globalPeak;
     if (a > peak) globalPeak = a;
     else if (peak > 0) globalPeak = peak - 10; 
@@ -349,12 +350,13 @@ void audioCoreTask(void *pvParameters) {
     int32_t rawSamples[BLOCK_SAMPLES]; 
 
     while (1) {
+        // Safe Watchdog Update: Kept at absolute top of thread block to avoid pause false-reboots
+        core1Heartbeat = millis();
+
         if (!recording) {
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
-
-        core1Heartbeat = millis();
 
         AudioBlock *block = NULL;
         if (xQueueReceive(freeBlockQueue, &block, 0) != pdTRUE) {
@@ -372,7 +374,7 @@ void audioCoreTask(void *pvParameters) {
         } else {
             size_t totalSamples = bytesRead / sizeof(int32_t);
             
-            // --- OPTIMIZED AGC/COMPRESSOR SIDECHAIN ---
+            // --- UNIFIED TRUE-ALPHA AGC/COMPRESSOR SIDECHAIN ---
             float maxBlockVal = 0.0f;
             for (size_t i = 0; i < totalSamples; i++) {
                 float s = fabsf((float)(rawSamples[i] >> 8));
@@ -380,11 +382,11 @@ void audioCoreTask(void *pvParameters) {
             }
 
             if (maxBlockVal > dsp.inputEnv) {
-                // Fast attack to catch loud peaks
+                // Symmetric Attack Envelope tracking
                 dsp.inputEnv = (1.0f - DSP_ATTACK_COEFF) * dsp.inputEnv + DSP_ATTACK_COEFF * maxBlockVal; 
             } else {
-                // Slow release to fade in background noise
-                dsp.inputEnv *= DSP_RELEASE_COEFF; 
+                // Symmetric Release Envelope tracking down to current signal background floor
+                dsp.inputEnv = (1.0f - DSP_RELEASE_COEFF) * dsp.inputEnv + DSP_RELEASE_COEFF * maxBlockVal; 
             }
 
             float envdB = -100.0f;
@@ -399,7 +401,7 @@ void audioCoreTask(void *pvParameters) {
 
             float totalGainDB = gainReductionDB + DSP_MAKEUP_GAIN_DB;
             float blockLinearGain = powf(10.0f, totalGainDB / 20.0f);
-            // ------------------------------------------
+            // ---------------------------------------------------
 
             float maxProcessedBlockVal = 0.0f;
             for (size_t i = 0; i < BLOCK_SAMPLES; i++) {
@@ -432,12 +434,24 @@ void audioCoreTask(void *pvParameters) {
             dsp.env = 0.9f * dsp.env + 0.1f * maxProcessedBlockVal;
         }
 
-        xQueueSend(filledBlockQueue, &block, 0);
-        lastAudioMs = millis();
-
-        if (queueUsed() < (QUEUE_BLOCKS / 2)) {
+        // --- PROACTIVE WATERMARK HYSTERESIS MONITORING ---
+        uint32_t currentQueueUsed = queueUsed();
+        if (currentQueueUsed > 108) { 
+            // High Watermark (~85% full): Set early warning flag BEFORE drop events occur
+            bufferWarning = true;
+        } else if (currentQueueUsed < 12) {
+            // Low Watermark (~10% full): Reset warning flag safely out of disk-bottleneck zone
             bufferWarning = false;
         }
+
+        // Leak Protection: Return block to free pool if filled queue rejects deployment
+        if (xQueueSend(filledBlockQueue, &block, 0) != pdTRUE) {
+            xQueueSend(freeBlockQueue, &block, 0); 
+            sys.bufferOverruns++;
+            bufferWarning = true;
+        }
+
+        lastAudioMs = millis();
     }
 }
 
@@ -493,7 +507,7 @@ void writeTaskStep() {
         if (sys.sdErrors > 10) diskFull = true;
     } else {
         sys.writes++;
-        if (sys.sdErrors == 0) sdWarning = false;
+        sdWarning = false; // Fixed: Dynamic clearance based on processing block state
     }
 
     xQueueSend(freeBlockQueue, &block, 0);
