@@ -23,11 +23,24 @@ When powering on, you should first see a blue LED to indicate boot status follow
 
 The goggle battery should be more than adequate even for very long flying sessions. The circuit draws only ~??mA while recording.
 
+A `manifest.log` file is written to the sd card during operation for debugging purposes. This can be handy if you run in to troubles with recordings. Lines are appended to the top of the file, and look like this:
+
+```
+OPEN,/rec_00000001_0001.24bit.raw,12405
+CLOSE,/rec_00000001_0001.24bit.raw,132405
+METADATA,/rec_00000001_0001.24bit.raw,PEAK=7842100,OVERRUNS=0,AVG_QUEUE=1.42,132410
+```
+- OPEN/CLOSE: These lines show the milliseconds when a file starts and stops. Calculating `OPEN - CLOSE` can help diagnose time stretching/drifting within a file. Similarly `CLOSE - OPEN` can pinpoint recording "blind spots" between files.
+- PEAK: Tells you the highest dynamic audio value recorded in that file segment ($0$ to $8,388,607$). If this hits $8,300,000$, your audio is actively pushing up against the hard limiter ceiling.
+- OVERRUNS: Isolates exactly how many buffer overruns happened inside that file only. If a file displays overruns while previous ones showed zero, you know the SD card experienced a heavy sector reallocation delay during that specific 2-minute flight window.
+- AVG_QUEUE: Represents the running average depth of the queue over time. A healthy value sits between 0.5 and 3.0. If this numbers climbs up to 15.0 or 30.0 on a file, it means your SD card is barely scraping by, and its write latency is dangerously close to causing a drop.
+
 ### Recording Format:
 Similar to how a dashcam/bodycam works, this code records audio to 24bit raw PCM files with routines that prevent data corruption when power is suddenly lost while recording. When power is cutoff, only the last seconds of the recording session will be lost. The files are named "rec_X-Y.24bit.raw", where X is the recording session, and Y is the audio segment. Both X and Y increment to allow easy reconstruction of wav files. The "manifest.txt" file keeps a log of segments that have been saved, as well as segments that were lost due to power cutoff. The newest segments will be at the top of the manifest file.
 
 The code makes use of an RMS audio compressor with smooth clipping that has been somewhat optimized for the hardware and intended application. Voices and noises farther away will have a similar volume to the voice of the person wearing the mic. Due to "aggressive AGC parameters", there will be some noise underlying the audio, but it is minimal. This ESP32 version of my original fpvGoggleAudioRecorder project (for RP2040) has a more sophisticated DSP thanks to the faster MCU with a hardware floating point unit. So audio quality is even better than before.
 
+### Post Processing:
 <img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/images/raw2wav.png" width="600">
 
 For convenience I created `raw2wav.exe`, a Windows executable that converts raw files recorded with the fpvGoggleAudioRecorderESP32 into easy to use wav files (raw2wav.exe, in raw2wav/dist/). To use the converter, run the `raw2wav.exe`, select the input folder (your SD card) and optionally an output folder. If any of the loaded files do not need conversion, uncheck the box next to them in the file selector area. Click the "Start" button to convert the selected files. The log area near the bottom shows which files are being converted and where the converted files are saved. You can click an output path in the log area to open the output folder in explorer.
