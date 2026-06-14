@@ -28,12 +28,52 @@
 // DSP & AGC (AUTOMATIC GAIN CONTROL) CONFIGURATION
 // ======================================================
 
+// High-Pass Filter: Prevents wind/breath rumble from falsely triggering the compressor.
+// [Recommended Range: 0.980f to 0.995f]
+// - 0.995f (~35Hz cut): Good for general audio, but lets wind rumble through.
+// - 0.988f (~80Hz cut): Standard vocal mic cutoff. Blocks breath plosives.
+// - 0.980f (~140Hz cut): Extreme wind reduction, but makes voices sound "thin" or tinny.
 #define DSP_HPF_COEFF 0.988f 
+
+// Attack Speed (True Alpha): How fast the system clamps down on sudden loud peaks.
+// [Recommended Range: 0.500f (Slower) to 0.990f (Brickwall)]
+// - 0.990f: Instant clamping. Catches aggressive transients but can sound slightly clicky.
+// - 0.900f: Sweet spot for vocal limiting. Fast enough to prevent clipping without artifacts.
+// - 0.500f: Relaxed attack. Lets quick claps or sharp shouts pass through uncompressed.
 #define DSP_ATTACK_COEFF 0.900f 
+
+// Release Speed (True Alpha): How smoothly volume fades back up to capture background noise.
+// [Recommended Range: 0.005f (Very Slow) to 0.050f (Very Fast)]
+// - 0.005f (~3-4 sec recovery): Slow, professional broadcast-style level gliding.
+// - 0.015f (~1-2 sec recovery): Sweet spot. Background tracks up naturally between spoken sentences.
+// - 0.050f (~200ms recovery): Fast pumping. Background environment noise rushes up between individual words.
 #define DSP_RELEASE_COEFF 0.015f 
+
+// Threshold (dB): Audio levels above this are compressed down.
+// [Recommended Range: -50.0f to -20.0f]
+// - -20.0f: Standard peak limiter. Only affects your voice when you actively shout.
+// - -40.0f: Sweet spot for AGC. Squashes your normal voice down so makeup gain can lift the background.
+// - -50.0f: Extreme sensitivity. Will start compressing ambient room noise and floor hiss.
 #define DSP_COMP_THRESHOLD_DB -40.0f
+
+// Ratio: How aggressively the loud audio is squashed above the threshold.
+// [Recommended Range: 2.0f to 20.0f]
+// - 2.0f: Gentle leveling. Sounds very natural, but loud shouts might still clip.
+// - 5.0f: Standard AGC ratio. Keeps vocal tracking relatively flat.
+// - 20.0f: Hard brickwall limiting. Absolute volume ceiling, but can sound crushed/distorted.
 #define DSP_COMP_RATIO 5.0f
+
+// Makeup Gain (dB): The massive volume boost applied to the entire signal.
+// [Recommended Range: 10.0f to 40.0f]
+// - 10.0f: Subtle boost. Good if you only care about your own voice.
+// - 30.0f: Sweet spot. Pulls distant 10ft conversations up to sound like they are 2ft away.
+// - 40.0f: Extreme gain. Will make a silent field sound like a wall of static/white noise.
 #define DSP_MAKEUP_GAIN_DB 30.0f
+
+// Absolute brickwall limit to prevent 24-bit integer overflow/wrap-around.
+// [Recommended Range: 8000000.0f to 8388600.0f]
+// - Do not exceed 8388607.0f (Theoretical 24-bit max). 
+// - 8300000.0f leaves a tiny safety margin to prevent digital wrap-around (which sounds like an explosive pop).
 #define DSP_LIMIT_MAX 8300000.0f 
 
 // ======================================================
