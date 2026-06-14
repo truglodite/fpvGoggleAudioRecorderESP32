@@ -23,7 +23,7 @@ When powering on, you should first see a blue LED to indicate boot status follow
 
 The goggle battery should be more than adequate even for very long flying sessions. The circuit draws only ~??mA while recording.
 
-A `manifest.log` file is written to the sd card during operation for debugging purposes. This can be handy if you run in to troubles with recordings. Lines are appended to the top of the file, and look like this:
+A `manifest.log` file is written to the sd card during operation for debugging purposes. This can be handy if you run in to troubles with recordings. Lines appended to the top of the file look like this:
 
 ```
 OPEN,/rec_00000001_0001.24bit.raw,12405
