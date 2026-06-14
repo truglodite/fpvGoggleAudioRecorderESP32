@@ -27,52 +27,12 @@
 // DSP & AGC (AUTOMATIC GAIN CONTROL) CONFIGURATION
 // ======================================================
 
-// High-Pass Filter: Prevents wind/breath rumble from falsely triggering the compressor.
-// [Recommended Range: 0.980f to 0.995f]
-// - 0.995f (~35Hz cut): Good for general audio, but lets wind rumble through.
-// - 0.988f (~80Hz cut): Standard vocal mic cutoff. Blocks breath plosives.
-// - 0.980f (~140Hz cut): Extreme wind reduction, but makes voices sound "thin" or tinny.
 #define DSP_HPF_COEFF 0.988f 
-
-// Attack Speed (True Alpha): How fast the system clamps down on sudden loud peaks.
-// [Recommended Range: 0.500f (Slower) to 0.990f (Brickwall)]
-// - 0.990f: Instant clamping. Catches aggressive transients but can sound slightly clicky.
-// - 0.900f: Sweet spot for vocal limiting. Fast enough to prevent clipping without artifacts.
-// - 0.500f: Relaxed attack. Lets quick claps or sharp shouts pass through uncompressed.
 #define DSP_ATTACK_COEFF 0.900f 
-
-// Release Speed (True Alpha): How smoothly volume fades back up to capture background noise.
-// [Recommended Range: 0.005f (Very Slow) to 0.050f (Very Fast)]
-// - 0.005f (~3-4 sec recovery): Slow, professional broadcast-style level gliding.
-// - 0.015f (~1-2 sec recovery): Sweet spot. Background tracks up naturally between spoken sentences.
-// - 0.050f (~200ms recovery): Fast pumping. Background environment noise rushes up between individual words.
 #define DSP_RELEASE_COEFF 0.015f 
-
-// Threshold (dB): Audio levels above this are compressed down.
-// [Recommended Range: -50.0f to -20.0f]
-// - -20.0f: Standard peak limiter. Only affects your voice when you actively shout.
-// - -40.0f: Sweet spot for AGC. Squashes your normal voice down so makeup gain can lift the background.
-// - -50.0f: Extreme sensitivity. Will start compressing ambient room noise and floor hiss.
 #define DSP_COMP_THRESHOLD_DB -40.0f
-
-// Ratio: How aggressively the loud audio is squashed above the threshold.
-// [Recommended Range: 2.0f to 20.0f]
-// - 2.0f: Gentle leveling. Sounds very natural, but loud shouts might still clip.
-// - 5.0f: Standard AGC ratio. Keeps vocal tracking relatively flat.
-// - 20.0f: Hard brickwall limiting. Absolute volume ceiling, but can sound crushed/distorted.
 #define DSP_COMP_RATIO 5.0f
-
-// Makeup Gain (dB): The massive volume boost applied to the entire signal.
-// [Recommended Range: 10.0f to 40.0f]
-// - 10.0f: Subtle boost. Good if you only care about your own voice.
-// - 30.0f: Sweet spot. Pulls distant 10ft conversations up to sound like they are 2ft away.
-// - 40.0f: Extreme gain. Will make a silent field sound like a wall of static/white noise.
 #define DSP_MAKEUP_GAIN_DB 30.0f
-
-// Absolute brickwall limit to prevent 24-bit integer overflow/wrap-around.
-// [Recommended Range: 8000000.0f to 8388600.0f]
-// - Do not exceed 8388607.0f (Theoretical 24-bit max). 
-// - 8300000.0f leaves a tiny safety margin to prevent digital wrap-around (which sounds like an explosive pop).
 #define DSP_LIMIT_MAX 8300000.0f 
 
 // ======================================================
@@ -86,17 +46,14 @@
 #define SEGMENT_MS             120000UL
 #define FLUSH_INTERVAL_MS      1000UL
 
-// 100% Outer Edge SPI Pin Mappings (Protects Boot Strapping / Flash)
-#define SD_MISO                1   // Outer Row Edge Pin
-#define SD_MOSI                2   // Outer Row Edge Pin
-#define SD_SCK                 3   // Outer Row Edge Pin
-#define SD_CS                  10  // Outer Row Edge Pin
+#define SD_MISO                1   
+#define SD_MOSI                2   
+#define SD_SCK                 3   
+#define SD_CS                  10  
 
-// Hardware Peripheral Interface Pin Mappings
-#define RGB_LED_PIN            48  // Confirmed NeoPixel Pin for this board
-#define BUTTON_PIN             7   // High-accessibility Edge Pin
+#define RGB_LED_PIN            48  
+#define BUTTON_PIN             7   
 
-// Hardware I2S Controller Interface Mapping
 #define I2S_BCLK_PIN           5
 #define I2S_WS_PIN             4   
 #define I2S_DATA_PIN           6
@@ -118,6 +75,7 @@ enum LedMode {
 volatile LedMode ledMode = LED_BOOT;
 
 volatile uint32_t globalPeak = 0;
+volatile uint32_t segmentPeak = 0; // Tracks absolute raw peak within the current segment
 volatile uint32_t lastAudioMs = 0;
 volatile uint32_t core1Heartbeat = 0;
 volatile uint32_t lastFileSplitMs = 0; 
@@ -145,7 +103,7 @@ QueueHandle_t freeBlockQueue = NULL;
 QueueHandle_t filledBlockQueue = NULL;
 
 // ======================================================
-// FILE I/O AND MEDIA SYSTEM DEFINITIONS
+// FILE I/O AND METADATA TELEMETRY FIELDS
 // ======================================================
 
 File audioFile;
@@ -155,6 +113,11 @@ char currentFilename[64];
 uint32_t sessionId = 0;
 uint32_t segmentId = 0;
 uint32_t segmentStartMs = 0;
+
+// Segment-specific tracking states for manifest output
+uint32_t segmentStartOverruns = 0;
+uint64_t segmentQueueSum = 0;
+uint32_t segmentQueueSamples = 0;
 
 struct SystemHealth {
     volatile uint32_t bufferOverruns = 0;
@@ -176,11 +139,13 @@ struct DSPState {
 DSPState dsp = {0.0f, 0.0f, 0.0f, 0.0f};
 
 inline void updatePeak24(int32_t sample) {
-    // Fixed inner-out conversion: Cast to unsigned before negating to prevent INT32_MIN overflow
     uint32_t a = (sample < 0) ? -(uint32_t)sample : (uint32_t)sample;
     uint32_t peak = globalPeak;
     if (a > peak) globalPeak = a;
     else if (peak > 0) globalPeak = peak - 10; 
+    
+    // Telemetry capture: Track the true maximum peak reached inside this file boundary
+    if (a > segmentPeak) segmentPeak = a;
 }
 
 // ======================================================
@@ -322,6 +287,12 @@ void openSegment() {
     if (!audioFile) fatalError();
     segmentStartMs = millis();
     
+    // Clear and establish telemetry markers for this distinct boundary block
+    segmentPeak = 0;
+    segmentStartOverruns = sys.bufferOverruns;
+    segmentQueueSum = 0;
+    segmentQueueSamples = 0;
+    
     lastFileSplitMs = millis();
     logEvent("OPEN", currentFilename);
 }
@@ -331,6 +302,25 @@ void closeSegment() {
     audioFile.flush();
     audioFile.close();
     logEvent("CLOSE", currentFilename);
+
+    // Process out structural performance data metrics for the completed timeline block
+    uint32_t overrunsInSegment = sys.bufferOverruns - segmentStartOverruns;
+    float avgQueueDepth = (segmentQueueSamples > 0) ? (float)segmentQueueSum / segmentQueueSamples : 0.0f;
+
+    // Append standard parsing format metadata injection row to tracking logs
+    if (manifestFile) {
+        manifestFile.print("METADATA,");
+        manifestFile.print(currentFilename);
+        manifestFile.print(",PEAK=");
+        manifestFile.print(segmentPeak);
+        manifestFile.print(",OVERRUNS=");
+        manifestFile.print(overrunsInSegment);
+        manifestFile.print(",AVG_QUEUE=");
+        manifestFile.print(avgQueueDepth, 2); 
+        manifestFile.print(",");
+        manifestFile.println(millis());
+        manifestFile.flush();
+    }
 }
 
 bool queueEmpty() {
@@ -350,7 +340,6 @@ void audioCoreTask(void *pvParameters) {
     int32_t rawSamples[BLOCK_SAMPLES]; 
 
     while (1) {
-        // Safe Watchdog Update: Kept at absolute top of thread block to avoid pause false-reboots
         core1Heartbeat = millis();
 
         if (!recording) {
@@ -374,7 +363,6 @@ void audioCoreTask(void *pvParameters) {
         } else {
             size_t totalSamples = bytesRead / sizeof(int32_t);
             
-            // --- UNIFIED TRUE-ALPHA AGC/COMPRESSOR SIDECHAIN ---
             float maxBlockVal = 0.0f;
             for (size_t i = 0; i < totalSamples; i++) {
                 float s = fabsf((float)(rawSamples[i] >> 8));
@@ -382,10 +370,8 @@ void audioCoreTask(void *pvParameters) {
             }
 
             if (maxBlockVal > dsp.inputEnv) {
-                // Symmetric Attack Envelope tracking
                 dsp.inputEnv = (1.0f - DSP_ATTACK_COEFF) * dsp.inputEnv + DSP_ATTACK_COEFF * maxBlockVal; 
             } else {
-                // Symmetric Release Envelope tracking down to current signal background floor
                 dsp.inputEnv = (1.0f - DSP_RELEASE_COEFF) * dsp.inputEnv + DSP_RELEASE_COEFF * maxBlockVal; 
             }
 
@@ -401,21 +387,18 @@ void audioCoreTask(void *pvParameters) {
 
             float totalGainDB = gainReductionDB + DSP_MAKEUP_GAIN_DB;
             float blockLinearGain = powf(10.0f, totalGainDB / 20.0f);
-            // ---------------------------------------------------
 
             float maxProcessedBlockVal = 0.0f;
             for (size_t i = 0; i < BLOCK_SAMPLES; i++) {
                 if (i < totalSamples) {
                     float x = (float)(rawSamples[i] >> 8);
                     
-                    // High-Pass Filter using defined coefficient
                     float hp = DSP_HPF_COEFF * dsp.hp + x - dsp.prev;
                     dsp.prev = x;
                     dsp.hp = hp;
 
                     hp *= blockLinearGain;
 
-                    // Brickwall limiter
                     if (hp > DSP_LIMIT_MAX)  hp = DSP_LIMIT_MAX;
                     if (hp < -DSP_LIMIT_MAX) hp = -DSP_LIMIT_MAX;
 
@@ -434,17 +417,13 @@ void audioCoreTask(void *pvParameters) {
             dsp.env = 0.9f * dsp.env + 0.1f * maxProcessedBlockVal;
         }
 
-        // --- PROACTIVE WATERMARK HYSTERESIS MONITORING ---
         uint32_t currentQueueUsed = queueUsed();
         if (currentQueueUsed > 108) { 
-            // High Watermark (~85% full): Set early warning flag BEFORE drop events occur
             bufferWarning = true;
         } else if (currentQueueUsed < 12) {
-            // Low Watermark (~10% full): Reset warning flag safely out of disk-bottleneck zone
             bufferWarning = false;
         }
 
-        // Leak Protection: Return block to free pool if filled queue rejects deployment
         if (xQueueSend(filledBlockQueue, &block, 0) != pdTRUE) {
             xQueueSend(freeBlockQueue, &block, 0); 
             sys.bufferOverruns++;
@@ -483,6 +462,14 @@ bool writeAudioBlock24(AudioBlock &block) {
 
 void writeTaskStep() {
     static uint32_t lastFlush = 0;
+    static uint32_t lastQueueSampleTime = 0;
+
+    // --- TIME-SERIES UNBIASED QUEUE TELEMETRY CAPTURE (100 Hz Sample Window) ---
+    if (recording && (millis() - lastQueueSampleTime >= 10)) {
+        lastQueueSampleTime = millis();
+        segmentQueueSum += queueUsed();
+        segmentQueueSamples++;
+    }
 
     if (!rolloverPending && (millis() - segmentStartMs >= SEGMENT_MS)) {
         rolloverPending = true;
@@ -507,7 +494,7 @@ void writeTaskStep() {
         if (sys.sdErrors > 10) diskFull = true;
     } else {
         sys.writes++;
-        sdWarning = false; // Fixed: Dynamic clearance based on processing block state
+        sdWarning = false; 
     }
 
     xQueueSend(freeBlockQueue, &block, 0);
