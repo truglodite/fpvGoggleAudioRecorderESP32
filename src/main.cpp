@@ -14,6 +14,31 @@
     - Disk Writing, File Operations, and UI handling locked to Core 0 (PRO_CPU)
     - Format: RAW 24-bit PCM, Signed little-endian (3 Bytes per sample), 44100 Hz mono
     - Hardware Floating-Point Unit (FPU) Optimized DSP chain
+
+    Fix log (pass 1 — review 1):
+    - FIX 1:  dsp.env atomic read-modify-write race corrected (load + store separately)
+    - FIX 2:  writeAudioBlock24 seek uses pre-write position instead of post-write position
+    - FIX 3:  sdWarning uses consecutive-success hysteresis instead of clearing on any write
+    - FIX 4:  diskFull checks actual SD free space in addition to write-error count
+    - FIX 5:  checkCore1Health flushes both queues before restarting the audio task
+    - FIX 6:  globalPeak decay is now multiplicative (rate-independent)
+    - FIX 7:  segmentQueueSamples comparison uses explicit .load()
+    - FIX 8:  portMEMORY_BARRIER() removed; std::atomic semantics are sufficient
+
+    Fix log (pass 2 — review 2):
+    - FIX 9:  SD.usedBytes() throttled to once per 5 s; no longer called on every write error
+    - FIX 10: consecutiveOkWrites reset in openSegment() so hysteresis restarts per segment
+    - FIX 11: core1Heartbeat assignments use explicit .store() for consistency
+    - FIX 12: lastAudioMs promoted to std::atomic<uint32_t> (written Core 1, read Core 0)
+    - FIX 13: xQueueSend to freeBlockQueue on overrun path now checked; leaks counted
+
+    Fix log (pass 3 — review 3):
+    - FIX 14: checkSdFreeSpace() returns immediately if diskFull already set
+    - FIX 15: segmentStartMs marked volatile; prevents compiler caching across loop()
+    - FIX 16: All SystemHealth counters promoted to std::atomic; increments use fetch_add
+    - FIX 17: checkButton() gated on !diskFull to prevent rollover into a full-disk openSegment()
+    - FIX 18: millis() called once in openSegment(); single value assigned to both timestamp fields
+    - FIX 19: flushAllQueues() documented — one pool slot is lost per recovery event by design
 */
 
 #include <Arduino.h>
@@ -45,36 +70,36 @@
 // Release Speed (True Alpha): How smoothly volume fades back up to capture background noise.
 // [Recommended Range: 0.005f (Very Slow) to 0.050f (Very Fast)]
 // - 0.005f (~3-4 sec recovery): Slow, professional broadcast-style level gliding.
-// - 0.015f (~1-2 sec recovery): Sweet spot. Background tracks up naturally between spoken sentences.
-// - 0.050f (~200ms recovery): Fast pumping. Background environment noise rushes up between individual words.
+// - 0.015f (~1-2 sec recovery): Sweet spot. Background tracks up naturally between sentences.
+// - 0.050f (~200ms recovery): Fast pumping. Background noise rushes up between words.
 #define DSP_RELEASE_COEFF 0.015f
 
 // Threshold (dB): Audio levels above this are compressed down.
 // [Recommended Range: -50.0f to -20.0f]
 // - -20.0f: Standard peak limiter. Only affects your voice when you actively shout.
-// - -40.0f: Sweet spot for AGC. Squashes your normal voice down so makeup gain can lift the background.
+// - -40.0f: Sweet spot for AGC. Squashes normal voice so makeup gain lifts the background.
 // - -50.0f: Extreme sensitivity. Will start compressing ambient room noise and floor hiss.
 #define DSP_COMP_THRESHOLD_DB -40.0f
 
-// Ratio: How aggressively the loud audio is squashed above the threshold.
+// Ratio: How aggressively loud audio is squashed above the threshold.
 // [Recommended Range: 2.0f to 20.0f]
-// - 2.0f: Gentle leveling. Sounds very natural, but loud shouts might still clip.
+// - 2.0f: Gentle leveling. Sounds natural, but loud shouts might still clip.
 // - 5.0f: Standard AGC ratio. Keeps vocal tracking relatively flat.
-// - 20.0f: Hard brickwall limiting. Absolute volume ceiling, but can sound crushed/distorted.
+// - 20.0f: Hard brickwall limiting. Absolute volume ceiling; can sound crushed/distorted.
 #define DSP_COMP_RATIO 5.0f
 
-// Makeup Gain (dB): The massive volume boost applied to the entire signal.
+// Makeup Gain (dB): The volume boost applied to the entire signal after compression.
 // [Recommended Range: 10.0f to 40.0f]
 // - 10.0f: Subtle boost. Good if you only care about your own voice.
-// - 30.0f: Sweet spot. Pulls distant 10ft conversations up to sound like they are 2ft away.
-// - 40.0f: Extreme gain. Will make a silent field sound like a wall of static/white noise.
+// - 30.0f: Sweet spot. Pulls distant conversations up to sound nearby.
+// - 40.0f: Extreme gain. Silent field sounds like a wall of white noise.
 #define DSP_MAKEUP_GAIN_DB 30.0f
 
 // Absolute brickwall limit to prevent 24-bit integer overflow/wrap-around.
 // [Recommended Range: 8000000.0f to 8388600.0f]
-// - Do not exceed 8388607.0f (Theoretical 24-bit max). 
-// - 8300000.0f leaves a tiny safety margin to prevent digital wrap-around (which sounds like an explosive pop).
-#define DSP_LIMIT_MAX 8300000.0f 
+// - Do not exceed 8388607.0f (theoretical 24-bit max).
+// - 8300000.0f leaves a safety margin against digital wrap-around pops.
+#define DSP_LIMIT_MAX 8300000.0f
 
 // ======================================================
 // SYSTEM CONFIGURATION
@@ -83,28 +108,35 @@
 #define SAMPLE_RATE            44100
 #define BLOCK_SAMPLES          256
 #define QUEUE_BLOCKS           128
-// Define the Warning High Water Mark (e.g., 85% full)
 #define QUEUE_WARN_THRESHOLD_HIGH (QUEUE_BLOCKS * 85 / 100)
-// Define the Warning Recovery Low Water Mark (e.g., 10% full)
 #define QUEUE_WARN_THRESHOLD_LOW  (QUEUE_BLOCKS * 10 / 100)
 
 #define SEGMENT_MS             120000UL
-#define FLUSH_INTERVAL_MS      1000UL
+#define FLUSH_INTERVAL_MS      1000UL   // Must be <= SD_SPACE_CHECK_MS
 
-#define SD_MISO                1   
-#define SD_MOSI                2   
-#define SD_SCK                 3   
-#define SD_CS                  10  
+// FIX 3: Consecutive successful writes required to clear sdWarning (hysteresis).
+#define SD_CONSECUTIVE_OK_CLEAR 16
 
-#define RGB_LED_PIN            48  
-#define BUTTON_PIN             7   
+// FIX 9: SD free-space is checked at most once per SD_SPACE_CHECK_MS.
+//        SD.usedBytes() is a slow FAT call; never call it in the write hot-path.
+//        Keep SD_SPACE_CHECK_MS >= FLUSH_INTERVAL_MS to avoid redundant FS calls.
+#define SD_FREE_BYTES_MIN  (64ULL * 1024 * 1024)   // ~64 MB safety margin
+#define SD_SPACE_CHECK_MS  5000UL
 
-#define I2S_BCLK_PIN           5
-#define I2S_WS_PIN             4   
-#define I2S_DATA_PIN           6
-#define I2S_NUM                I2S_NUM_0
+#define SD_MISO            1
+#define SD_MOSI            2
+#define SD_SCK             3
+#define SD_CS              10
 
-#define CORE1_TIMEOUT_MS       2000
+#define RGB_LED_PIN        48
+#define BUTTON_PIN         7
+
+#define I2S_BCLK_PIN       5
+#define I2S_WS_PIN         4
+#define I2S_DATA_PIN       6
+#define I2S_NUM            I2S_NUM_0
+
+#define CORE1_TIMEOUT_MS   2000
 
 // ======================================================
 // RUNTIME SYSTEM STATES
@@ -120,15 +152,15 @@ enum LedMode {
 volatile LedMode ledMode = LED_BOOT;
 
 std::atomic<uint32_t> globalPeak{0};
-volatile uint32_t lastAudioMs = 0;
-std::atomic<uint32_t> core1Heartbeat{0};
+std::atomic<uint32_t> lastAudioMs{0};       // FIX 12: atomic — written Core 1, read Core 0
+std::atomic<uint32_t> core1Heartbeat{0};    // FIX 11: all writes use explicit .store()
 std::atomic<uint32_t> segmentPeak{0};
-volatile uint32_t lastFileSplitMs = 0; 
+volatile uint32_t     lastFileSplitMs = 0;  // Core 0 only — volatile sufficient
 
-volatile bool fatalState = false;
-volatile bool sdWarning = false;
+volatile bool fatalState    = false;
+volatile bool sdWarning     = false;
 volatile bool bufferWarning = false;
-volatile bool diskFull = false;
+volatile bool diskFull      = false;
 std::atomic<bool> recording{false};
 std::atomic<bool> rolloverPending{false};
 std::atomic<bool> limiterActive{false};
@@ -140,11 +172,11 @@ Freenove_ESP32_WS2812 statusLED(1, RGB_LED_PIN, 0, TYPE_GRB);
 // ======================================================
 
 struct AudioBlock {
-    int32_t samples[BLOCK_SAMPLES]; 
+    int32_t samples[BLOCK_SAMPLES];
 };
 
-AudioBlock queueBuffer[QUEUE_BLOCKS];
-QueueHandle_t freeBlockQueue = NULL;
+AudioBlock    queueBuffer[QUEUE_BLOCKS];
+QueueHandle_t freeBlockQueue   = NULL;
 QueueHandle_t filledBlockQueue = NULL;
 
 // ======================================================
@@ -155,51 +187,57 @@ File audioFile;
 File manifestFile;
 char currentFilename[64];
 
-uint32_t sessionId = 0;
-uint32_t segmentId = 0;
-uint32_t segmentStartMs = 0;
+uint32_t          sessionId      = 0;
+uint32_t          segmentId      = 0;
+volatile uint32_t segmentStartMs = 0;  // FIX 15: volatile — read in loop(), written in openSegment()
 
-// Segment-specific tracking states for manifest output
 uint32_t segmentStartOverruns = 0;
 std::atomic<uint32_t> segmentQueueSum{0};
 std::atomic<uint32_t> segmentQueueSamples{0};
 
+// FIX 10: File-scope so openSegment() can reset it at every segment boundary.
+uint32_t consecutiveOkWrites = 0;
+
+// FIX 16: All counters promoted to std::atomic so Core 1 increments are safe.
+//         Increments use fetch_add(1, relaxed) — ordering not required for diagnostics.
 struct SystemHealth {
-    volatile uint32_t bufferOverruns = 0;
-    volatile uint32_t i2sTimeouts    = 0;
-    volatile uint32_t sdErrors       = 0;
-    volatile uint32_t writes         = 0;
+    std::atomic<uint32_t> bufferOverruns{0};
+    std::atomic<uint32_t> i2sTimeouts{0};
+    std::atomic<uint32_t> sdErrors{0};
+    std::atomic<uint32_t> writes{0};
+    std::atomic<uint32_t> poolLeaks{0};   // FIX 13: pool slots lost when both queues are full
 };
 SystemHealth sys;
 
 TaskHandle_t AudioCoreTaskHandle = NULL;
 
-struct DSPState { 
-    float hp = 0.0f;        
-    float prev = 0.0f;      
-    float inputEnv = 0.0f;  
-    std::atomic<float> env{0.0f}; // Use curly braces for atomic member initialization 
+struct DSPState {
+    float hp       = 0.0f;
+    float prev     = 0.0f;
+    float inputEnv = 0.0f;
+    std::atomic<float> env{0.0f};
 };
-
 DSPState dsp;
+
+// ======================================================
+// PEAK TRACKING
+// ======================================================
 
 inline void updatePeak24(int32_t sample) {
     uint32_t a = (sample < 0) ? -(uint32_t)sample : (uint32_t)sample;
-    
-    // Global peak tracking... (you should make globalPeak atomic too)
+
+    // FIX 6: Multiplicative decay — rate-independent of block size / call frequency.
     uint32_t peak = globalPeak.load(std::memory_order_relaxed);
-    if (a > peak) globalPeak.store(a, std::memory_order_relaxed);
-    else if (peak > 0) globalPeak.store(peak - 10, std::memory_order_relaxed);
-    
-    // Safely update the segment peak
-    uint32_t current_peak = segmentPeak.load(std::memory_order_relaxed);
-    while (a > current_peak) {
-        // compare_exchange_weak atomically checks if segmentPeak still equals current_peak.
-        // If yes, it sets it to 'a' and returns true.
-        // If no (because Core 0 just reset it to 0), it updates current_peak to 0 and loops again.
-        if (segmentPeak.compare_exchange_weak(current_peak, a, std::memory_order_relaxed)) {
-            break; 
-        }
+    if (a > peak) {
+        globalPeak.store(a, std::memory_order_relaxed);
+    } else {
+        globalPeak.store((uint32_t)(peak * 0.999f), std::memory_order_relaxed);
+    }
+
+    // Lock-free CAS loop — safely races with Core 0's openSegment() reset.
+    uint32_t cur = segmentPeak.load(std::memory_order_relaxed);
+    while (a > cur) {
+        if (segmentPeak.compare_exchange_weak(cur, a, std::memory_order_relaxed)) break;
     }
 }
 
@@ -213,27 +251,20 @@ void updateLED() {
     lastUpdate = millis();
 
     static uint32_t redAlertExpiryMs = 0;
-    static float rollingMax = 100.0f; 
-    
-    rollingMax *= 0.995f; 
+    static float    rollingMax       = 100.0f;
+
+    rollingMax *= 0.995f;
     if (rollingMax < 100.0f) rollingMax = 100.0f;
 
-    // Safely load the envelope from Core 1 without compiler optimization bugs
+    // FIX 1: Explicit atomic load.
     float currentEnv = dsp.env.load(std::memory_order_relaxed);
+    if (currentEnv > rollingMax) rollingMax = currentEnv;
 
-    if (currentEnv > rollingMax) {
-        rollingMax = currentEnv;
-    }
-
-    // Trigger red LED if the envelope is very high
     if (currentEnv > (rollingMax * 0.85f) && currentEnv > 500.0f) {
-        redAlertExpiryMs = millis() + 500; 
+        redAlertExpiryMs = millis() + 500;
     }
-
-    // Trigger red LED if the DSP actually hit the hard digital ceiling
-    // exchange() reads the flag and instantly resets it to false in one safe step
     if (limiterActive.exchange(false, std::memory_order_relaxed)) {
-        redAlertExpiryMs = millis() + 500; 
+        redAlertExpiryMs = millis() + 500;
     }
 
     if (fatalState || diskFull) {
@@ -248,52 +279,46 @@ void updateLED() {
         case LED_BOOT:
             statusLED.setLedColor(0, 0, 0, 150);
             break;
-            
+
         case LED_FATAL: {
             static bool toggle = false;
             toggle = !toggle;
-            if (toggle) statusLED.setLedColor(0, 255, 0, 0); 
-            else statusLED.setLedColor(0, 0, 0, 0);
+            statusLED.setLedColor(0, toggle ? 255 : 0, 0, 0);
             break;
         }
-        
+
         case LED_WARN: {
             static uint8_t slowToggle = 0;
             if (++slowToggle > 10) {
                 slowToggle = 0;
                 static bool wToggle = false;
                 wToggle = !wToggle;
-                if (wToggle) statusLED.setLedColor(0, 200, 100, 0); 
-                else statusLED.setLedColor(0, 0, 0, 0);
+                statusLED.setLedColor(0, wToggle ? 200 : 0, wToggle ? 100 : 0, 0);
             }
             break;
         }
-        
-        case LED_RECORDING:
-            if ((millis() - lastFileSplitMs) < 600) {
-                statusLED.setLedColor(0, 0, 0, 255); // Blue on file split
-            } 
-            else if (millis() < redAlertExpiryMs) {
-                statusLED.setLedColor(0, 255, 0, 0); // Red on high volume or clip
-            } 
-            else if ((millis() - lastAudioMs) < 250) {
-                if (millis() % 1000 < 150) {
-                    statusLED.setLedColor(0, 0, 150, 0); // Bright green pulse
-                } else {
-                    statusLED.setLedColor(0, 0, 20, 0);  // Dim green baseline
-                }
+
+        case LED_RECORDING: {
+            uint32_t now = millis();
+            if ((now - lastFileSplitMs) < 600) {
+                statusLED.setLedColor(0, 0, 0, 255);     // Blue on file split
+            } else if (now < redAlertExpiryMs) {
+                statusLED.setLedColor(0, 255, 0, 0);     // Red on high volume or clip
+            } else if ((now - lastAudioMs.load(std::memory_order_relaxed)) < 250) {
+                // FIX 12: .load() — lastAudioMs is atomic.
+                statusLED.setLedColor(0, 0, (now % 1000 < 150) ? 150 : 20, 0);
             } else {
                 statusLED.setLedColor(0, 50, 0, 50);     // Purple standby/idle
             }
             break;
+        }
     }
 }
 
 void fatalError() {
     fatalState = true;
-    if (audioFile) audioFile.close();
+    if (audioFile)    audioFile.close();
     if (manifestFile) manifestFile.close();
-    
     while (1) {
         updateLED();
         delay(50);
@@ -327,7 +352,7 @@ uint32_t loadSessionCounter() {
     if (SD.exists("/session.dat")) {
         File f = SD.open("/session.dat", FILE_READ);
         if (f) {
-            if (f.available() >= sizeof(id)) {
+            if (f.available() >= (int)sizeof(id)) {
                 f.read((uint8_t *)&id, sizeof(id));
             }
             f.close();
@@ -345,17 +370,24 @@ uint32_t loadSessionCounter() {
 
 void openSegment() {
     segmentId++;
-    snprintf(currentFilename, sizeof(currentFilename), "/rec_%08u_%04u.24bit.raw", sessionId, segmentId);
+    snprintf(currentFilename, sizeof(currentFilename),
+             "/rec_%08u_%04u.24bit.raw", sessionId, segmentId);
     audioFile = SD.open(currentFilename, FILE_WRITE);
     if (!audioFile) fatalError();
-    segmentStartMs = millis();
-    // Clear and establish telemetry markers for this distinct boundary block
+
+    // FIX 18: Single millis() call — both timestamps are guaranteed identical.
+    uint32_t now      = millis();
+    segmentStartMs    = now;
+    lastFileSplitMs   = now;
+
     segmentPeak.store(0, std::memory_order_relaxed);
-    segmentStartOverruns = sys.bufferOverruns;
+    segmentStartOverruns = sys.bufferOverruns.load(std::memory_order_relaxed);
     segmentQueueSum.store(0, std::memory_order_relaxed);
     segmentQueueSamples.store(0, std::memory_order_relaxed);
-    
-    lastFileSplitMs = millis();
+
+    // FIX 10: Reset hysteresis at segment boundary — sdWarning re-arms for the new file.
+    consecutiveOkWrites = 0;
+
     logEvent("OPEN", currentFilename);
 }
 
@@ -365,20 +397,25 @@ void closeSegment() {
     audioFile.close();
     logEvent("CLOSE", currentFilename);
 
-    // Process out structural performance data metrics for the completed timeline block
-    uint32_t overrunsInSegment = sys.bufferOverruns - segmentStartOverruns;
-    float avgQueueDepth = (segmentQueueSamples > 0) ? (float)segmentQueueSum / segmentQueueSamples : 0.0f;
+    uint32_t overrunsInSegment =
+        sys.bufferOverruns.load(std::memory_order_relaxed) - segmentStartOverruns;
 
-    // Append standard parsing format metadata injection row to tracking logs
+    // FIX 7: Explicit .load() on atomics before arithmetic.
+    uint32_t qs  = segmentQueueSamples.load(std::memory_order_relaxed);
+    uint32_t qsu = segmentQueueSum.load(std::memory_order_relaxed);
+    float    avgQueueDepth = (qs > 0) ? (float)qsu / qs : 0.0f;
+
     if (manifestFile) {
         manifestFile.print("METADATA,");
         manifestFile.print(currentFilename);
         manifestFile.print(",PEAK=");
-        manifestFile.print(segmentPeak);
+        manifestFile.print(segmentPeak.load(std::memory_order_relaxed));
         manifestFile.print(",OVERRUNS=");
         manifestFile.print(overrunsInSegment);
         manifestFile.print(",AVG_QUEUE=");
-        manifestFile.print(avgQueueDepth, 2); 
+        manifestFile.print(avgQueueDepth, 2);
+        manifestFile.print(",POOL_LEAKS=");
+        manifestFile.print(sys.poolLeaks.load(std::memory_order_relaxed));
         manifestFile.print(",");
         manifestFile.println(millis());
         manifestFile.flush();
@@ -394,15 +431,16 @@ uint32_t queueUsed() {
 }
 
 // ======================================================
-// DEDICATED CORE 1 HIGH-PRIORITY AUDIO INTERRUPT LOOP
+// DEDICATED CORE 1 HIGH-PRIORITY AUDIO CAPTURE LOOP
 // ======================================================
 
 void audioCoreTask(void *pvParameters) {
-    size_t bytesRead = 0;
-    int32_t rawSamples[BLOCK_SAMPLES]; 
+    size_t  bytesRead = 0;
+    int32_t rawSamples[BLOCK_SAMPLES];
 
     while (1) {
-        core1Heartbeat = millis();
+        // FIX 11: Explicit .store() — consistent with all other heartbeat write sites.
+        core1Heartbeat.store(millis(), std::memory_order_relaxed);
 
         if (!recording) {
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -411,20 +449,21 @@ void audioCoreTask(void *pvParameters) {
 
         AudioBlock *block = NULL;
         if (xQueueReceive(freeBlockQueue, &block, 0) != pdTRUE) {
-            sys.bufferOverruns++;
+            sys.bufferOverruns.fetch_add(1, std::memory_order_relaxed);  // FIX 16
             bufferWarning = true;
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
 
-        esp_err_t err = i2s_read(I2S_NUM, &rawSamples, sizeof(rawSamples), &bytesRead, pdMS_TO_TICKS(20));
-        
+        esp_err_t err = i2s_read(I2S_NUM, &rawSamples, sizeof(rawSamples),
+                                  &bytesRead, pdMS_TO_TICKS(20));
+
         if (err != ESP_OK || bytesRead == 0) {
-            sys.i2sTimeouts++;
+            sys.i2sTimeouts.fetch_add(1, std::memory_order_relaxed);  // FIX 16
             memset(block->samples, 0, sizeof(block->samples));
         } else {
             size_t totalSamples = bytesRead / sizeof(int32_t);
-            
+
             float maxBlockVal = 0.0f;
             for (size_t i = 0; i < totalSamples; i++) {
                 float s = fabsf((float)(rawSamples[i] >> 8));
@@ -432,9 +471,11 @@ void audioCoreTask(void *pvParameters) {
             }
 
             if (maxBlockVal > dsp.inputEnv) {
-                dsp.inputEnv = (1.0f - DSP_ATTACK_COEFF) * dsp.inputEnv + DSP_ATTACK_COEFF * maxBlockVal; 
+                dsp.inputEnv = (1.0f - DSP_ATTACK_COEFF)  * dsp.inputEnv
+                             + DSP_ATTACK_COEFF  * maxBlockVal;
             } else {
-                dsp.inputEnv = (1.0f - DSP_RELEASE_COEFF) * dsp.inputEnv + DSP_RELEASE_COEFF * maxBlockVal; 
+                dsp.inputEnv = (1.0f - DSP_RELEASE_COEFF) * dsp.inputEnv
+                             + DSP_RELEASE_COEFF * maxBlockVal;
             }
 
             float envdB = -100.0f;
@@ -444,29 +485,28 @@ void audioCoreTask(void *pvParameters) {
 
             float gainReductionDB = 0.0f;
             if (envdB > DSP_COMP_THRESHOLD_DB) {
-                gainReductionDB = (1.0f - (1.0f / DSP_COMP_RATIO)) * (DSP_COMP_THRESHOLD_DB - envdB);
+                gainReductionDB = (1.0f - (1.0f / DSP_COMP_RATIO))
+                                * (DSP_COMP_THRESHOLD_DB - envdB);
             }
 
-            float totalGainDB = gainReductionDB + DSP_MAKEUP_GAIN_DB;
-            float blockLinearGain = powf(10.0f, totalGainDB / 20.0f);
+            float blockLinearGain = powf(10.0f,
+                                         (gainReductionDB + DSP_MAKEUP_GAIN_DB) / 20.0f);
 
             float maxProcessedBlockVal = 0.0f;
-            bool blockClipped = false; // <-- NEW: Local flag for this block
+            bool  blockClipped         = false;
 
             for (size_t i = 0; i < BLOCK_SAMPLES; i++) {
                 if (i < totalSamples) {
-                    float x = (float)(rawSamples[i] >> 8);
-                    
+                    float x  = (float)(rawSamples[i] >> 8);
                     float hp = DSP_HPF_COEFF * dsp.hp + x - dsp.prev;
                     dsp.prev = x;
-                    dsp.hp = hp;
+                    dsp.hp   = hp;
 
                     hp *= blockLinearGain;
 
-                    // NEW: Trip the local flag if we hit the limit
                     if (hp > DSP_LIMIT_MAX) {
                         hp = DSP_LIMIT_MAX;
-                        blockClipped = true; 
+                        blockClipped = true;
                     } else if (hp < -DSP_LIMIT_MAX) {
                         hp = -DSP_LIMIT_MAX;
                         blockClipped = true;
@@ -476,50 +516,51 @@ void audioCoreTask(void *pvParameters) {
                     updatePeak24(block->samples[i]);
 
                     float absHp = fabsf(hp);
-                    if (absHp > maxProcessedBlockVal) {
-                        maxProcessedBlockVal = absHp;
-                    }
+                    if (absHp > maxProcessedBlockVal) maxProcessedBlockVal = absHp;
                 } else {
-                    block->samples[i] = 0; 
+                    block->samples[i] = 0;
                 }
             }
 
-            // NEW: Pass the status to Core 0 safely
             if (blockClipped) {
                 limiterActive.store(true, std::memory_order_relaxed);
             }
 
-            dsp.env = 0.9f * dsp.env + 0.1f * maxProcessedBlockVal;
+            // FIX 1: Separate load + store — prevents non-atomic RMW on the atomic.
+            float prevEnv = dsp.env.load(std::memory_order_relaxed);
+            dsp.env.store(0.9f * prevEnv + 0.1f * maxProcessedBlockVal,
+                          std::memory_order_relaxed);
         }
 
         uint32_t currentQueueUsed = queueUsed();
-        if (currentQueueUsed > QUEUE_WARN_THRESHOLD_HIGH) { 
+        if (currentQueueUsed > QUEUE_WARN_THRESHOLD_HIGH) {
             bufferWarning = true;
         } else if (currentQueueUsed < QUEUE_WARN_THRESHOLD_LOW) {
             bufferWarning = false;
         }
 
-        // If a rollover is pending, stop the producer!
-        // This allows the queue to drain and guarantees the rollover can complete.
+        // Pause producer during rollover so the queue drains cleanly before
+        // Core 0 closes and opens the segment file.
         if (rolloverPending.load(std::memory_order_relaxed)) {
-            // We are waiting for the SD card to finish the old file.
-            // We discard the current sample/block to keep the queue draining.
-            xQueueSend(freeBlockQueue, &block, 0); // Put the empty buffer back
-            vTaskDelay(pdMS_TO_TICKS(1));          // Wait briefly
-            continue;                              // Skip the rest of the loop
+            xQueueSend(freeBlockQueue, &block, 0);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
         }
 
         if (xQueueSend(filledBlockQueue, &block, 0) != pdTRUE) {
-            xQueueSend(freeBlockQueue, &block, 0); 
-            sys.bufferOverruns++;
+            // FIX 13 / FIX 16: Check the fallback send; count any unrecoverable leak.
+            if (xQueueSend(freeBlockQueue, &block, 0) != pdTRUE) {
+                sys.poolLeaks.fetch_add(1, std::memory_order_relaxed);
+            }
+            sys.bufferOverruns.fetch_add(1, std::memory_order_relaxed);
             bufferWarning = true;
         }
 
-        // Unbiased, jitter-free queue telemetry
         segmentQueueSum.fetch_add(currentQueueUsed, std::memory_order_relaxed);
         segmentQueueSamples.fetch_add(1, std::memory_order_relaxed);
 
-        lastAudioMs = millis();
+        // FIX 12: Explicit .store() — lastAudioMs is atomic.
+        lastAudioMs.store(millis(), std::memory_order_relaxed);
     }
 }
 
@@ -528,49 +569,58 @@ void audioCoreTask(void *pvParameters) {
 // ======================================================
 
 bool writeAudioBlock24(AudioBlock &block) {
-    uint8_t packedBuffer[BLOCK_SAMPLES * 3];
+    uint8_t  packedBuffer[BLOCK_SAMPLES * 3];
     uint16_t packIndex = 0;
 
-    // Pack samples...
     for (int i = 0; i < BLOCK_SAMPLES; i++) {
-        int32_t sample = block.samples[i];
-        packedBuffer[packIndex++] = (uint8_t)(sample & 0xFF);
-        packedBuffer[packIndex++] = (uint8_t)((sample >> 8) & 0xFF);
-        packedBuffer[packIndex++] = (uint8_t)((sample >> 16) & 0xFF);
+        int32_t s = block.samples[i];
+        packedBuffer[packIndex++] = (uint8_t)( s        & 0xFF);
+        packedBuffer[packIndex++] = (uint8_t)((s >>  8) & 0xFF);
+        packedBuffer[packIndex++] = (uint8_t)((s >> 16) & 0xFF);
     }
 
     const size_t expectedBytes = sizeof(packedBuffer);
 
     for (int retry = 0; retry < 3; retry++) {
-        size_t bytesWritten = audioFile.write(packedBuffer, expectedBytes);
-        
-        // Success case: The entire block was written
-        if (bytesWritten == expectedBytes) {
-            return true;
-        }
+        // FIX 2: Capture position before write so partial writes rewind to the
+        //        correct byte — not to the ambiguous post-partial-write position.
+        uint32_t writeStart   = audioFile.position();
+        size_t   bytesWritten = audioFile.write(packedBuffer, expectedBytes);
 
-        // Partial write case: This is a hardware/timeout issue. 
-        // We should NOT keep that partial data. 
-        // We need to seek back to the start of this block to try again.
-        if (bytesWritten > 0) {
-            uint32_t currentPos = audioFile.position();
-            audioFile.seek(currentPos - bytesWritten);
-        }
-        
+        if (bytesWritten == expectedBytes) return true;
+        if (bytesWritten > 0)             audioFile.seek(writeStart);
+
         vTaskDelay(pdMS_TO_TICKS(2));
     }
     return false;
 }
 
+// FIX 9 / FIX 14: Throttled SD free-space check.
+//   - SD.usedBytes() is a slow FAT layer call; never run it in the write hot-path.
+//   - FIX 14: Returns immediately if diskFull is already set — avoids redundant FS calls
+//     during the one loop() iteration between diskFull being set and fatalError() firing.
+void checkSdFreeSpace() {
+    if (diskFull) return;                                    // FIX 14
+    static uint32_t lastSpaceCheckMs = 0;
+    if ((millis() - lastSpaceCheckMs) < SD_SPACE_CHECK_MS) return;
+    lastSpaceCheckMs = millis();
+
+    if ((SD.totalBytes() - SD.usedBytes()) < SD_FREE_BYTES_MIN) {
+        diskFull = true;
+    }
+}
+
 void writeTaskStep() {
     static uint32_t lastFlush = 0;
-    static uint32_t lastQueueSampleTime = 0;
 
-    // --- TIME-SERIES UNBIASED QUEUE TELEMETRY CAPTURE (100 Hz Sample Window) ---
+    // FIX 15: segmentStartMs is volatile — read is not cached across iterations.
     if (!rolloverPending && (millis() - segmentStartMs >= SEGMENT_MS)) {
         rolloverPending = true;
-        portMEMORY_BARRIER();
+        // FIX 8: std::atomic store provides the required memory fence; no barrier needed.
     }
+
+    // FIX 9: Periodic space check, fully decoupled from the write-error path.
+    checkSdFreeSpace();
 
     AudioBlock *block = NULL;
     if (xQueueReceive(filledBlockQueue, &block, 0) != pdTRUE) {
@@ -578,34 +628,43 @@ void writeTaskStep() {
             closeSegment();
             openSegment();
             rolloverPending = false;
-            portMEMORY_BARRIER();
         }
         return;
     }
 
     bool ok = writeAudioBlock24(*block);
     if (!ok) {
-        sys.sdErrors++;
+        sys.sdErrors.fetch_add(1, std::memory_order_relaxed);  // FIX 16
+        consecutiveOkWrites = 0;   // FIX 3: Reset hysteresis on any error
         sdWarning = true;
-        if (sys.sdErrors > 10) diskFull = true;
+
+        // FIX 4: Sustained-error threshold; space-exhaustion lives in checkSdFreeSpace().
+        if (sys.sdErrors.load(std::memory_order_relaxed) > 10) {
+            diskFull = true;
+        }
     } else {
-        sys.writes++;
-        sdWarning = false; 
+        sys.writes.fetch_add(1, std::memory_order_relaxed);  // FIX 16
+        // FIX 3: Clear sdWarning only after SD_CONSECUTIVE_OK_CLEAR clean writes in a row.
+        if (++consecutiveOkWrites >= SD_CONSECUTIVE_OK_CLEAR) {
+            sdWarning = false;
+        }
     }
 
     xQueueSend(freeBlockQueue, &block, 0);
 
     if ((millis() - lastFlush) > FLUSH_INTERVAL_MS) {
-        if (audioFile) audioFile.flush();
+        if (audioFile)    audioFile.flush();
         if (manifestFile) manifestFile.flush();
         lastFlush = millis();
     }
 
+    // Second rollover check: fires after the very last block before the deadline drains.
+    // NOTE: if writeAudioBlock24 failed on this last block, the rollover still proceeds
+    // and the failed block's data is silently dropped. sdWarning is set in that case.
     if (rolloverPending && queueEmpty()) {
         closeSegment();
         openSegment();
         rolloverPending = false;
-        portMEMORY_BARRIER();
     }
 }
 
@@ -615,20 +674,22 @@ void writeTaskStep() {
 
 void checkButton() {
     static uint32_t lastDebounceTime = 0;
-    static bool lastButtonState = HIGH;
-    static bool buttonState = HIGH;
+    static bool     lastButtonState  = HIGH;
+    static bool     buttonState      = HIGH;
 
     bool reading = digitalRead(BUTTON_PIN);
     if (reading != lastButtonState) lastDebounceTime = millis();
 
-    if ((millis() - lastDebounceTime) > 50) { 
+    if ((millis() - lastDebounceTime) > 50) {
         if (reading != buttonState) {
             buttonState = reading;
             if (buttonState == LOW) {
-                if (recording && !rolloverPending) {
+                // FIX 17: Gate on !diskFull — triggering a rollover when the disk is full
+                //         would call openSegment() → SD.open() → likely fatalError() from
+                //         inside the rollover path rather than cleanly from loop().
+                if (recording && !rolloverPending && !diskFull) {
                     Serial.println(">>> MANUAL SPLIT REQUESTED <<<");
                     rolloverPending = true;
-                    portMEMORY_BARRIER();
                 }
             }
         }
@@ -638,48 +699,58 @@ void checkButton() {
 
 void initAudioHardware() {
     i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, 
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate          = SAMPLE_RATE,
+        .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = 64,
-        .use_apll = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0
+        .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count        = 8,
+        .dma_buf_len          = 64,
+        .use_apll             = false,
+        .tx_desc_auto_clear   = false,
+        .fixed_mclk           = 0
     };
-
     i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_BCLK_PIN,
-        .ws_io_num = I2S_WS_PIN,
+        .bck_io_num   = I2S_BCLK_PIN,
+        .ws_io_num    = I2S_WS_PIN,
         .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_DATA_PIN
+        .data_in_num  = I2S_DATA_PIN
     };
-
     if (i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL) != ESP_OK) fatalError();
     if (i2s_set_pin(I2S_NUM, &pin_config) != ESP_OK) fatalError();
 }
 
+// FIX 5: Drains stale filled blocks back to the free pool before restarting the audio
+//        task, so pre-crash and post-recovery audio are never interleaved in the file.
+// FIX 19: KNOWN LIMITATION — if the audio task was killed while holding a block (i.e.
+//         mid-DSP with a block dequeued but not yet sent anywhere), that slot is lost.
+//         One pool slot leaks per recovery event. With QUEUE_BLOCKS = 128, 128 stalls
+//         are required before pool exhaustion becomes a real concern.
+void flushAllQueues() {
+    AudioBlock *block = NULL;
+    while (xQueueReceive(filledBlockQueue, &block, 0) == pdTRUE) {
+        xQueueSend(freeBlockQueue, &block, 0);
+    }
+}
+
 void checkCore1Health() {
-    if ((millis() - core1Heartbeat) > CORE1_TIMEOUT_MS) {
+    if ((millis() - core1Heartbeat.load(std::memory_order_relaxed)) > CORE1_TIMEOUT_MS) {
         Serial.println("!!! AUDIO CORE STALLED: ATTEMPTING RECOVERY !!!");
-        
-        // 1. Force the audio task to stop
+
         vTaskDelete(AudioCoreTaskHandle);
-        
-        // 2. Tear down and re-init I2S (Force hardware reset)
+        AudioCoreTaskHandle = NULL;
+
         i2s_driver_uninstall(I2S_NUM);
-        
-        // 3. Re-init using our new helper function
+
+        flushAllQueues();  // FIX 5
+
         initAudioHardware();
 
-        // 4. Restart the task
-        xTaskCreatePinnedToCore(audioCoreTask, "AudioCapture", 8192, NULL, 
+        xTaskCreatePinnedToCore(audioCoreTask, "AudioCapture", 8192, NULL,
                                 configMAX_PRIORITIES - 1, &AudioCoreTaskHandle, 1);
-        
-        core1Heartbeat = millis(); // Reset heartbeat to prevent loop-rebooting
+
+        core1Heartbeat.store(millis(), std::memory_order_relaxed);  // FIX 11
     }
 }
 
@@ -688,8 +759,14 @@ void printStats() {
     if ((millis() - lastPrint) < 5000) return;
     lastPrint = millis();
 
-    Serial.printf("writes=%u overruns=%u i2s=%u sd=%u queued=%u\n", 
-                  sys.writes, sys.bufferOverruns, sys.i2sTimeouts, sys.sdErrors, queueUsed());
+    // FIX 16: All counters are now atomic; .load() for consistent snapshot reads.
+    Serial.printf("writes=%u overruns=%u i2s=%u sd=%u queued=%u leaks=%u\n",
+                  sys.writes.load(std::memory_order_relaxed),
+                  sys.bufferOverruns.load(std::memory_order_relaxed),
+                  sys.i2sTimeouts.load(std::memory_order_relaxed),
+                  sys.sdErrors.load(std::memory_order_relaxed),
+                  queueUsed(),
+                  sys.poolLeaks.load(std::memory_order_relaxed));
 }
 
 // ======================================================
@@ -698,22 +775,22 @@ void printStats() {
 
 void setup() {
     Serial.begin(115200);
-    
+
     statusLED.begin();
-    statusLED.setBrightness(40); 
-    statusLED.setLedColor(0, 0, 0, 150); 
-    
+    statusLED.setBrightness(40);
+    statusLED.setLedColor(0, 0, 0, 150);
+
     pinMode(BUTTON_PIN, INPUT_PULLUP);
 
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    if (!SD.begin(SD_CS, SPI, 40000000)) { 
+    if (!SD.begin(SD_CS, SPI, 40000000)) {
         Serial.println("SD Initialization Failed!");
         fatalError();
     }
 
-    freeBlockQueue = xQueueCreate(QUEUE_BLOCKS, sizeof(AudioBlock*));
-    filledBlockQueue = xQueueCreate(QUEUE_BLOCKS, sizeof(AudioBlock*));
-    if (freeBlockQueue == NULL || filledBlockQueue == NULL) {
+    freeBlockQueue   = xQueueCreate(QUEUE_BLOCKS, sizeof(AudioBlock *));
+    filledBlockQueue = xQueueCreate(QUEUE_BLOCKS, sizeof(AudioBlock *));
+    if (!freeBlockQueue || !filledBlockQueue) {
         Serial.println("Queue Allocation Failed!");
         fatalError();
     }
@@ -732,16 +809,16 @@ void setup() {
     recording = true;
 
     xTaskCreatePinnedToCore(
-        audioCoreTask,          
-        "AudioCapture",         
-        8192,                   
-        NULL,                   
+        audioCoreTask,
+        "AudioCapture",
+        8192,
+        NULL,
         configMAX_PRIORITIES - 1,
-        &AudioCoreTaskHandle,   
-        1                       
+        &AudioCoreTaskHandle,
+        1
     );
 
-    core1Heartbeat = millis();
+    core1Heartbeat.store(millis(), std::memory_order_relaxed);  // FIX 11
 }
 
 void loop() {
@@ -754,5 +831,5 @@ void loop() {
         fatalError();
     }
     printStats();
-    vTaskDelay(pdMS_TO_TICKS(1)); 
+    vTaskDelay(pdMS_TO_TICKS(1));
 }
