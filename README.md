@@ -70,17 +70,17 @@ SD |   CS |   10
 SD |    3v3 |   3v3
 BUTT |   A/B |   6/GND
 
-<img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/enclosure/wiring.jpg" width="600">
+<img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/images/wiring.jpg" width="600">
 
 ### Printable Enclosure:
 
-<img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/enclosure/enclosureESPrender.png" width="600">
+<img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/images/enclosureESPrender.png" width="600">
 
 *In development, but it will be very similar to the original form factor*
 Files for a printable enclosure are provided in this repo. One of each part should be printed. Print the "agcRecorderTopWindscreen.stl" if you want to use a 10mm foam or furry cover for the mic. ABS or PETG is recommended for the top, bottom, and shim. Clear PETG filament should be used for the lens. Some glue is needed for a durable assembly; I used T-7000 glue on all of the joints described below.
 
 To assemble the enclosure, first test fit your button, boards, and mic in the enclosure top/bottom. The mic is oriented with pin holes toward the top, with the mic hole facing out the side with the hole in it. The ESP32 is inserted with buttons facing the top, USB out the side. The button is rotated with pin sides facing the mic/usb sides of the enclosure. The SD card board is placed with the metal card insert part facing toward the top. First insert the lens, button, and mic in the top half, then insert the ESP32 board. Insert the SD board in the bottom half. Place the board shim over the ESP32 processor, and press the bottom half onto the top half. There are tabs for a click fit between the top/bottom halves. When assembled, verify the button protrudes out the top enough for easy operation, the SD card is easy to insert/remove, USB cable is easy to get to, and the case halves close completely. There should be an even 1mm gap around the edge where the top/bottom halves fit together. Also make sure you can fit a paper clip or similar rod through the Boot/Reset button access holes located near the lens.
 
-<img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/enclosure/assembly.jpg" width="600">
+<img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/images/assembly.jpg" width="600">
 
 The enclosure is very compact; 30awg silicone wire or smaller is recommended. Make all wires long enough to reach when assembled, but not so long that assembly can pinch a wire. Leave enough length on the SD card wires so the enclosure halves can easily be assembled/disassembled. Solder wires for the button and add heatshrink; break off the unused pins from the other side of the button. Solder wires to the chip side of the microphone. Solder wires to the back side (opposite of boot/reset buttons) on the ESP32. When wires are all soldered, glue the button into place taking care not to allow glue to squirt where it may interfere with operation. Glue the lens into the top half of the case. Add glue to the rails where the ESP32 and SD card boards will rest, and insert the components into the case halves. Snap case halves together taking care not to pinch any wires. Add the windscreen cover if desired; some glue around the bottom of the windstopper basket where it touches the box will offer a more reliable hold.
