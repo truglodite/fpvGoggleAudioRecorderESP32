@@ -28,7 +28,7 @@ A `manifest.log` file is written to the sd card during operation for debugging p
 ```
 OPEN,/rec_00000001_0001.24bit.raw,12405
 CLOSE,/rec_00000001_0001.24bit.raw,132405
-METADATA,/rec_00000001_0001.24bit.raw,PEAK=7842100,OVERRUNS=0,AVG_QUEUE=1.42,132410
+METADATA,/rec_00000001_0001.24bit.raw,PEAK=7842100,OVERRUNS=0,AVG_QUEUE=1.42,POOL_LEAKS=0,16586
 ```
 - OPEN/CLOSE: These lines show the milliseconds when a file starts and stops. Calculating `OPEN - CLOSE` can help diagnose time stretching/drifting within a file. Similarly `CLOSE - OPEN` can pinpoint recording "blind spots" between files.
 - PEAK: Tells you the highest dynamic audio value recorded in that file segment ($0$ to $8,388,607$). If this hits $8,300,000$, your audio is actively pushing up against the hard limiter ceiling.
