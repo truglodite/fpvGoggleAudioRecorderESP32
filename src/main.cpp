@@ -33,21 +33,21 @@
 // - 0.995f (~35Hz cut): Good for general audio, but lets wind rumble through.
 // - 0.988f (~80Hz cut): Standard vocal mic cutoff. Blocks breath plosives.
 // - 0.980f (~140Hz cut): Extreme wind reduction, but makes voices sound "thin" or tinny.
-#define DSP_HPF_COEFF 0.988f 
+#define DSP_HPF_COEFF 0.988f
 
 // Attack Speed (True Alpha): How fast the system clamps down on sudden loud peaks.
 // [Recommended Range: 0.500f (Slower) to 0.990f (Brickwall)]
 // - 0.990f: Instant clamping. Catches aggressive transients but can sound slightly clicky.
 // - 0.900f: Sweet spot for vocal limiting. Fast enough to prevent clipping without artifacts.
 // - 0.500f: Relaxed attack. Lets quick claps or sharp shouts pass through uncompressed.
-#define DSP_ATTACK_COEFF 0.900f 
+#define DSP_ATTACK_COEFF 0.900f
 
 // Release Speed (True Alpha): How smoothly volume fades back up to capture background noise.
 // [Recommended Range: 0.005f (Very Slow) to 0.050f (Very Fast)]
 // - 0.005f (~3-4 sec recovery): Slow, professional broadcast-style level gliding.
 // - 0.015f (~1-2 sec recovery): Sweet spot. Background tracks up naturally between spoken sentences.
 // - 0.050f (~200ms recovery): Fast pumping. Background environment noise rushes up between individual words.
-#define DSP_RELEASE_COEFF 0.015f 
+#define DSP_RELEASE_COEFF 0.015f
 
 // Threshold (dB): Audio levels above this are compressed down.
 // [Recommended Range: -50.0f to -20.0f]

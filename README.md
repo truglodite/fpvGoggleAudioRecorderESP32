@@ -41,7 +41,7 @@ Similar to how a dashcam/bodycam works, this code records audio to 24bit raw PCM
 The code makes use of an RMS audio compressor with smooth clipping that has been somewhat optimized for the hardware and intended application. Voices and noises farther away will have a similar volume to the voice of the person wearing the mic. Due to "aggressive AGC parameters", there will be some noise underlying the audio, but it is minimal. This ESP32 version of my original fpvGoggleAudioRecorder project (for RP2040) has a more sophisticated DSP thanks to the faster MCU with a hardware floating point unit. So audio quality is even better than before.
 
 ### Post Processing:
-<img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/images/raw2wav.png" width="600">
+<img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/raw2wav/raw2wav.png" width="600">
 
 For convenience I created `raw2wav.exe`, a Windows executable that converts raw files recorded with the fpvGoggleAudioRecorderESP32 into easy to use wav files (raw2wav.exe, in raw2wav/dist/). To use the converter, run the `raw2wav.exe`, select the input folder (your SD card) and optionally an output folder. If any of the loaded files do not need conversion, uncheck the box next to them in the file selector area. Click the "Start" button to convert the selected files. The log area near the bottom shows which files are being converted and where the converted files are saved. You can click an output path in the log area to open the output folder in explorer.
 
