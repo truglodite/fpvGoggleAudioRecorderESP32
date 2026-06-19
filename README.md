@@ -16,8 +16,8 @@
 
 ### Hardware:
 *Prefer no pins installed if using the printable enclosure*
-- ESP32 S3 Super Mini: https://www.amazon.com/dp/B0GFDSK5RD
-- ICS43434 I2S Microphone: https://www.amazon.com/ICS43434-Microphone-Breakout-Module-Filter/dp/B0FMDGRM8F
+- ESP32 S3 Super Mini Board: https://www.amazon.com/dp/B0GFDSK5RD
+- ICS43434 I2S Microphone Board: https://www.amazon.com/ICS43434-Microphone-Breakout-Module-Filter/dp/B0FMDGRM8F
 - Micro SD Card Board (3.3V): https://www.amazon.com/WWZMDiB-Module-Adapter-Memory-Shield/dp/B0BV8ZQ81F
 - 6mm Momentary NO Tactile Button: https://www.amazon.com/Momentary-Tactile-Through-Breadboard-Friendly/dp/B07WF76VHT
 - 10mm Microphone Wind Screen: https://www.amazon.com/dp/B07BQ2LZDX
@@ -27,11 +27,11 @@
 * I recommend removing the 4 resistors on the SD card board. Leaving the resistors on may cause problems with certain SD cards.
 
 ### Operation
-Simply plug a USB-C to USB-C cable between the recorder and your goggle charging jack, and fly as usual. 
+Simply plug a USB-C to USB-C cable between the recorder and your goggle charging jack, and fly as usual. This has been tested with DJI goggles 1, 2, and 3. Fully automated recording should also work with any goggles that output 5V only while turned on.
 
-Audio will start recording when you power on your goggles, and recording stops safely when you power them off. If you want to start a new segment file while recording, click the button. This can be useful if for example you wait a while for GPS before launching, hit the button so you have an audio file that starts just before launching.
+Audio will start recording when you power on your goggles, and recording will stop when you power them off. If you want to start a new segment file while recording, click the button. This can be useful if for example you have to wait a while for GPS satellites before launching. You can hit the button just before launching so less jogging is required for A/V sync in your editor.
 
-The code makes use of the onboard LED to indicate status. A blue LED to indicates boot status immediately after powering on. While recording, a green pulsating LED and an occasional red LED will indicate proper recording and clipping limiter operation. After a button press, a blue LED will briefly light to indicate a new segment file is started. A repeated flashing red led indicates a failure (usually the SD card has come loose or otherwise failed). An orange flashing LED indicates the audio buffer is falling behind (extremely rare; typically caused by poor wiring or slow/failing sd cards).
+The code makes use of the onboard LED to indicate status. A blue LED to indicates boot status immediately after powering on. While recording, a green pulsating LED with an occasional red LED will indicate normal recording and clipping limiter operation. After a button press, a blue LED will briefly light to indicate a the current segment file is closed and a new segment file is started. A repeated flashing red led indicates a failure (usually the SD card has come loose or otherwise failed). An orange flashing LED indicates the audio buffer is falling behind (extremely rare; typically caused by poor wiring or slow/failing sd cards).
 
 <img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/images/currentDraw.jpg" width="600">
 
@@ -40,7 +40,7 @@ The circuit averages ~50mA current draw while recording. Operating the recorder 
 ### Recording Format:
 Similar to how a dashcam/bodycam works, this code records audio to 24bit 44.1khz raw PCM files with routines that prevent data corruption when power is suddenly lost while recording. When power is cutoff, typically only the last 0-200msec of audio are lost; in a rare worst case event the last ~1.7sec may be lost. The files are named "rec_X-Y.24bit.raw", where X is the recording session, and Y is the audio segment. Both X and Y increment to allow sequential reconstruction recordings. A new segment file is created within a session after every ~2min of recording, or after the new segment file button is pressed. New sessions are created after power cycles.
 
-The code makes use of an RMS audio compressor with smooth clipping that has been somewhat optimized for the hardware and intended application. Voices and noises farther away will have a similar volume to the voice of the person wearing the mic. Due to "aggressive AGC parameters", there will be some noise underlying the audio, but it is minimal. This ESP32 version of my original fpvGoggleAudioRecorder project (for RP2040) has a more sophisticated DSP thanks to the faster MCU with a hardware floating point unit. So audio quality is even better than before. Users can easily modify the DSP parameters and recompile to suit tastes/applications using the #defines located at the top of the code.
+The code makes use of an DSP filter with HPF, RMS audio compressor, and clipping limiter that have are tuned for the intended "FPV ambient voice and noise" application. Noises farther away will have a similar volume to the voice of the person wearing the mic. The default DSP parameters are a bit aggressive. So there will be some underlying noise during quiet portions of a recording, but it is not very obtrusive. DSP parameters can be adjusted to reduce this noisefloor hiss, but doing so will come at the cost of not clearly hearing distant voices and noises. This ESP32 version of my original fpvGoggleAudioRecorder project (for RP2040) offers major improvements to the audio pipeline and DSP, thanks to the faster ESP32 with a hardware floating point unit. Users can modify DSP parameters to suit their specific needs by editing values of the 7 `#defines` located at the top of the code.
 
 ### Post Processing:
 <img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/raw2wav/raw2wav.png" width="600">
@@ -52,7 +52,7 @@ The input file list has drop down boxes for audio resolution. 16bit is there for
 Note that raw2wav.exe does not actually modify the audio content; it simply adds wav headers to the raw data and saves the files with a `*.wav` extension. Alternatively, you can do your conversions using a program like Audacity to "import raw data", "24bit unsigned", "little endian", "mono", with "44100hz" bit rate, and export to a wav file.
 
 ### Logging:
-A `manifest.log` file is written to the sd card during operation for troubleshooting purposes. Below is an example of lines that may be appended to the log (note that CLOSE and METADATA lines are written only when a segment last longer than ~2min, or when the new segment button is used):
+A `manifest.log` file is saved to the sd card for troubleshooting purposes. Below is an example of lines that may be appended to the log (note that CLOSE and METADATA lines are written only when a segment last longer than ~2min, or when the new segment button is used):
 
 ```
 OPEN,/rec_00000001_0001.24bit.raw,12405
@@ -61,16 +61,16 @@ METADATA,/rec_00000001_0001.24bit.raw,PEAK=7842100,OVERRUNS=0,AVG_QUEUE=1.42,POO
 ```
 
 - OPEN/CLOSE: The millisecond timer value when a segment file starts or stops. Calculating sequential `OPEN time - CLOSE time` can help diagnose time stretching/drifting within a file (often caused by overheating or an imprecise XTAL oscillator). Similarly, sequential file `CLOSE time - OPEN time` calculation can pinpoint recording "blind spots" between files (typically caused by poor SD card performance).
-- PEAK: Tells you the highest 24bit dynamic audio value recorded in that file segment ($0$ to $8,388,607$). If this hits $8,300,000$, your loud noises are actively pushing the mic up against the hard limiter ceiling.
+- PEAK: Tells you the highest 24bit dynamic audio value recorded in that file segment ($0$ to $8,388,607$). During typical use this should be roughly ~7,500,000, indicating proper AGC tuning for the application. If this value is very low (~300,000) or high (constently near or equal to $8,300,000$), your DSP parameters may need tweaking to make use of the available dynamic range for your application.
 - OVERRUNS: The number of dropped audio blocks. This should remain zero. If this value is non-zero but small, and POOL_LEAKS is zero, it indicates a temporary overload the system recovered from. If this value is huge and POOL_LEAKS is zero, it indicates a slow SD card.
 - AVG_QUEUE: Represents the running average depth of the queue over time. A healthy value sits between 0.5 and 3.0. If this numbers climbs up to 15.0 or 30.0 on a file, it indicates high SD card write latency, which may affect the reliability of recordings.
 - POOL_LEAKS: The number of audio core crashes. This should remain zero. This part contains 2 values, X,Y. X represents the number of audio core crashes that resulted in a lost audio block, and Y is the total number of blocks that have passed through the capture queue. Similar to OVERRUNS, a non-zero X indicates a slow or defective SD card. If you modify the DSP, POOL_LEAKS can also indicate high DSP overhead; this has not been observed with the default DSP configuration.
 
 ### Flashing/Compiling:
-I recommend using VSCode with the PlatformIO extension installed on your PC to compile and upload this code to your ESP32 board. Download and unzip this repo to your `Projects`. Open the folder with the "Open Project" button in PlatformIO home. Connect your esp32 to USB, and click the upload button to compile+upload the firmware to your ESP32 (right arrow button on the bottom bar in VSCode). Further details on setting up and using PlatformIO are beyond the scope this repo.
+I recommend using VSCode with the PlatformIO extension installed on your PC to compile and upload this code to your ESP32 board. Download and unzip this repo to your `Projects` folder. Use the "Open Project" button in PlatformIO home and select the `fpvgoggleaudiorecorderesp32-main` folder. Connect your esp32 to a USB port on your PC, and click the upload button to compile and upload the firmware to your ESP32 (right arrow button on the bottom bar in VSCode). Further details on setting up and using PlatformIO are beyond the scope this repo.
 
 ### Wiring:
-Wire the hardware as shown in the table below.
+Connect the hardware together as shown in the table below.
 
 Device  |   Pin |   ESP32 Pin
 ----|-----|----
