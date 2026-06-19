@@ -1,19 +1,18 @@
 # fpvGoggleAudioRecorderESP32
-## A reliable audio recording device for FPV goggles
+## An easy to use reliable audio recording device for FPV goggles
 
 <img src="https://github.com/truglodite/fpvgoggleaudiorecorderesp32/blob/main/images/assembly2.jpg" width="600">
 
-A simple and reliable ambient audio recorder project for use on FPV goggles.
-
 ### Features:
-- Easy plug and forget fully automatic recording
-- 24bit-44k audio recording
-- Tunable DSP filtering with RMS AGC and clipping limiter
-- Efficient and reliable dual core separation of audio and sd write engines
+- Easy to use "plug and forget" fully automated recording to sd card
+- Powered via goggle USB charging jack
+- 24bit-44khz audio pipeline
+- DSP filter with RMS AGC and clipping limiter (pre-tuned, user adjustable)
+- Robust and efficient dual core separated audio and sd write engines
 - Corruption resistant raw PCM recording format and sd write methods
-- "Start new file" button
-- Easy to use Raw to Wav file converter app for PC
-- Printable enclosure
+- "Start new segment file" button
+- Easy to use Raw->Wav file converter app for PC
+- Compact printable enclosure
 
 ### Hardware:
 *Prefer no pins installed if using the printable enclosure*
@@ -30,41 +29,45 @@ A simple and reliable ambient audio recorder project for use on FPV goggles.
 ### Operation
 Simply plug a USB-C to USB-C cable between the recorder and your goggle charging jack, and fly as usual. 
 
-Audio will start recording when you power on your goggles, and recording stops safely when you power them off. If you need to start a new file while recording, click the button and a new file will be started. This can be useful if for example you wait a while for GPS before launching, hit the button so you have an audio file that starts just before launching.
+Audio will start recording when you power on your goggles, and recording stops safely when you power them off. If you want to start a new segment file while recording, click the button. This can be useful if for example you wait a while for GPS before launching, hit the button so you have an audio file that starts just before launching.
 
-The code makes use of the onboard LED to indicate status. A blue LED to indicates boot status immediately after powering on. While recording, a green pulsating LED indicates proper operation, and an occasional red LED will indicate the DSP clipping limiter is engaged. After a button press, a blue LED will briefly light to indicate a new file is started. A repeated flashing red led indicates a failure (usually the SD card has come loose or otherwise failed). An orange flashing LED indicates the audio buffer is falling behind (extremely rare; usually caused from poor wiring or bad sd cards).
+The code makes use of the onboard LED to indicate status. A blue LED to indicates boot status immediately after powering on. While recording, a green pulsating LED and an occasional red LED will indicate proper recording and clipping limiter operation. After a button press, a blue LED will briefly light to indicate a new segment file is started. A repeated flashing red led indicates a failure (usually the SD card has come loose or otherwise failed). An orange flashing LED indicates the audio buffer is falling behind (extremely rare; typically caused by poor wiring or slow/failing sd cards).
 
 <img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/images/currentDraw.jpg" width="600">
 
-The circuit averages ~50mA current draw while recording. So operating the recorder from a standard goggle battery will not noticeably decrease battery run time.
+The circuit averages ~50mA current draw while recording. Operating the recorder with a standard goggle battery will not appreciably decrease run time.
 
-A `manifest.log` file is written to the sd card during operation for debugging purposes. This can be handy if you run in to troubles with recordings. Below is an example of lines written to the log:
+### Recording Format:
+Similar to how a dashcam/bodycam works, this code records audio to 24bit 44.1khz raw PCM files with routines that prevent data corruption when power is suddenly lost while recording. When power is cutoff, typically only the last 0-200msec of audio are lost; in a rare worst case event the last ~1.7sec may be lost. The files are named "rec_X-Y.24bit.raw", where X is the recording session, and Y is the audio segment. Both X and Y increment to allow sequential reconstruction recordings. A new segment file is created within a session after every ~2min of recording, or after the new segment file button is pressed. New sessions are created after power cycles.
+
+The code makes use of an RMS audio compressor with smooth clipping that has been somewhat optimized for the hardware and intended application. Voices and noises farther away will have a similar volume to the voice of the person wearing the mic. Due to "aggressive AGC parameters", there will be some noise underlying the audio, but it is minimal. This ESP32 version of my original fpvGoggleAudioRecorder project (for RP2040) has a more sophisticated DSP thanks to the faster MCU with a hardware floating point unit. So audio quality is even better than before. Users can easily modify the DSP parameters and recompile to suit tastes/applications using the #defines located at the top of the code.
+
+### Post Processing:
+<img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/raw2wav/raw2wav.png" width="600">
+
+For convenience I created `raw2wav.exe`, a Windows executable that converts batches of raw files recorded with the fpvGoggleAudioRecorderESP32 into easy to use wav files (raw2wav.exe, in raw2wav/dist/). To use the converter, run the `raw2wav.exe`, select the input folder (your SD card) and optionally an output folder. If any of the loaded files do not need conversion, uncheck the box next to them in the file selector area. Click the "Start" button to convert the selected files. The log area near the bottom shows which files are being converted and where the converted files are saved. You can click an output path in the log area to open the output folder in explorer. 
+
+The input file list has drop down boxes for audio resolution. 16bit is there for my older RP2040 based goggle recorder project. The app will automatically select the correct 16bit or 24bit resolution based on the presence or absence of "24bit" in the filename.
+
+Note that raw2wav.exe does not actually modify the audio content; it simply adds wav headers to the raw data and saves the files with a `*.wav` extension. Alternatively, you can do your conversions using a program like Audacity to "import raw data", "24bit unsigned", "little endian", "mono", with "44100hz" bit rate, and export to a wav file.
+
+### Logging:
+A `manifest.log` file is written to the sd card during operation for troubleshooting purposes. Below is an example of lines that may be appended to the log (note that CLOSE and METADATA lines are written only when a segment last longer than ~2min, or when the new segment button is used):
 
 ```
 OPEN,/rec_00000001_0001.24bit.raw,12405
 CLOSE,/rec_00000001_0001.24bit.raw,132405
 METADATA,/rec_00000001_0001.24bit.raw,PEAK=7842100,OVERRUNS=0,AVG_QUEUE=1.42,POOL_LEAKS=0,16586
 ```
-- OPEN/CLOSE: This is the millisecond timer when a file starts and stops. Calculating adjacent `OPEN time - CLOSE time` can help diagnose time stretching/drifting within a file. Similarly, adjacent file `CLOSE time - OPEN time` calculation can pinpoint recording "blind spots" between files.
-- PEAK: Tells you the highest dynamic audio value recorded in that file segment ($0$ to $8,388,607$). If this hits $8,300,000$, your mic is actively pushing up against the hard limiter ceiling by very loud noises.
-- OVERRUNS: Isolates exactly how many buffer overruns happened inside that file only. If this value is non-zero, it is usually caused by your SD card having a prolonged FAT sector reallocation delay.
+
+- OPEN/CLOSE: The millisecond timer value when a segment file starts or stops. Calculating sequential `OPEN time - CLOSE time` can help diagnose time stretching/drifting within a file (often caused by overheating or an imprecise XTAL oscillator). Similarly, sequential file `CLOSE time - OPEN time` calculation can pinpoint recording "blind spots" between files (typically caused by poor SD card performance).
+- PEAK: Tells you the highest 24bit dynamic audio value recorded in that file segment ($0$ to $8,388,607$). If this hits $8,300,000$, your loud noises are actively pushing the mic up against the hard limiter ceiling.
+- OVERRUNS: The number of dropped audio blocks. This should remain zero. If this value is non-zero but small, and POOL_LEAKS is zero, it indicates a temporary overload the system recovered from. If this value is huge and POOL_LEAKS is zero, it indicates a slow SD card.
 - AVG_QUEUE: Represents the running average depth of the queue over time. A healthy value sits between 0.5 and 3.0. If this numbers climbs up to 15.0 or 30.0 on a file, it indicates high SD card write latency, which may affect the reliability of recordings.
-- POOL_LEAKS: Similar to OVERRUNS, but summed for the whole recording session instead of per file. This part is contains 2 values, X,Y. X represents the actual number of leaked blocks from the audio capture queue, and Y is the total number of blocks that have passed through the capture queue. X should remain zero, and Y will increase recording session duration.
-
-### Recording Format:
-Similar to how a dashcam/bodycam works, this code records audio to 24bit raw PCM files with routines that prevent data corruption when power is suddenly lost while recording. When power is cutoff, only the last seconds of the recording session will be lost. The files are named "rec_X-Y.24bit.raw", where X is the recording session, and Y is the audio segment. Both X and Y increment to allow easy reconstruction of wav files. The "manifest.txt" file keeps a log of segments that have been saved, as well as segments that were lost due to power cutoff. The newest segments will be at the top of the manifest file.
-
-The code makes use of an RMS audio compressor with smooth clipping that has been somewhat optimized for the hardware and intended application. Voices and noises farther away will have a similar volume to the voice of the person wearing the mic. Due to "aggressive AGC parameters", there will be some noise underlying the audio, but it is minimal. This ESP32 version of my original fpvGoggleAudioRecorder project (for RP2040) has a more sophisticated DSP thanks to the faster MCU with a hardware floating point unit. So audio quality is even better than before.
-
-### Post Processing:
-<img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/raw2wav/raw2wav.png" width="600">
-
-For convenience I created `raw2wav.exe`, a Windows executable that converts raw files recorded with the fpvGoggleAudioRecorderESP32 into easy to use wav files (raw2wav.exe, in raw2wav/dist/). To use the converter, run the `raw2wav.exe`, select the input folder (your SD card) and optionally an output folder. If any of the loaded files do not need conversion, uncheck the box next to them in the file selector area. Click the "Start" button to convert the selected files. The log area near the bottom shows which files are being converted and where the converted files are saved. You can click an output path in the log area to open the output folder in explorer.
-
-Alternatively, you can use an audio editing program like Audacity to "import raw data", 24bit unsigned, with "little endian", and "44000" bit rate, and export a wav file.
+- POOL_LEAKS: The number of audio core crashes. This should remain zero. This part contains 2 values, X,Y. X represents the number of audio core crashes that resulted in a lost audio block, and Y is the total number of blocks that have passed through the capture queue. Similar to OVERRUNS, a non-zero X indicates a slow or defective SD card. If you modify the DSP, POOL_LEAKS can also indicate high DSP overhead; this has not been observed with the default DSP configuration.
 
 ### Flashing/Compiling:
-To flash your ESP32, you will need VSCode with the PlatformIO extension installed on your PC. The details on how to do this are beyond the scope of this repo. Download and unzip this repo to your `Projects` folder on your pc. Open the folder using the "Open Project" button in PlatformIO home. Connect your esp32 to USB, and click the right arrow button (on the bottom bar in VSCode) to compile+upload the firmware to your ESP32.
+I recommend using VSCode with the PlatformIO extension installed on your PC to compile and upload this code to your ESP32 board. Download and unzip this repo to your `Projects`. Open the folder with the "Open Project" button in PlatformIO home. Connect your esp32 to USB, and click the upload button to compile+upload the firmware to your ESP32 (right arrow button on the bottom bar in VSCode). Further details on setting up and using PlatformIO are beyond the scope this repo.
 
 ### Wiring:
 Wire the hardware as shown in the table below.
