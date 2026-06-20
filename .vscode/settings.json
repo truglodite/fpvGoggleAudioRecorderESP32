@@ -1,0 +1,5 @@
+{
+    "C_Cpp.default.compilerPath": "C:/Users/Kevin/.platformio/packages/toolchain-xtensa-esp32s3/bin/xtensa-esp32s3-elf-gcc.exe",
+    "C_Cpp.default.configurationProvider": "platformio.platformio-ide",
+    "C_Cpp.intelliSenseEngine": "default"
+}

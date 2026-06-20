@@ -1,7 +1,7 @@
 # fpvGoggleAudioRecorderESP32
 ## An easy to use reliable audio recording device for FPV goggles
 
-<img src="https://github.com/truglodite/fpvgoggleaudiorecorderesp32/blob/main/images/assembly2.jpg" width="600">
+<img src="https://github.com/truglodite/fpvgoggleaudiorecorderesp32/blob/main/images/assembly3.jpg" width="600">
 
 ### Features:
 - Easy to use "plug and forget" fully automated recording to sd card
@@ -61,13 +61,13 @@ METADATA,/rec_00000001_0001.24bit.raw,PEAK=7842100,OVERRUNS=0,AVG_QUEUE=1.42,POO
 ```
 
 - OPEN/CLOSE: The millisecond timer value when a segment file starts or stops. Calculating sequential `OPEN time - CLOSE time` can help diagnose time stretching/drifting within a file (often caused by overheating or an imprecise XTAL oscillator). Similarly, sequential file `CLOSE time - OPEN time` calculation can pinpoint recording "blind spots" between files (typically caused by poor SD card performance).
-- PEAK: Tells you the highest 24bit dynamic audio value recorded in that file segment ($0$ to $8,388,607$). During typical use this should be roughly ~7,500,000, indicating proper AGC tuning for the application. If this value is very low (~300,000) or high (constently near or equal to $8,300,000$), your DSP parameters may need tweaking to make use of the available dynamic range for your application.
+- PEAK: Tells you the highest 24bit dynamic audio value recorded in that file segment ($0$ to $8,388,607$). During typical use this should be roughly ~7,500,000, indicating proper AGC tuning for the application. If this value is very low (~300,000) or high (constently near or equal to $8,300,000$), it indicates poor utilization of the available dynamic range from the audio engine. Your DSP parameters (or choice of mic) may not be well suited to your application, and tweaking these items may help.
 - OVERRUNS: The number of dropped audio blocks. This should remain zero. If this value is non-zero but small, and POOL_LEAKS is zero, it indicates a temporary overload the system recovered from. If this value is huge and POOL_LEAKS is zero, it indicates a slow SD card.
 - AVG_QUEUE: Represents the running average depth of the queue over time. A healthy value sits between 0.5 and 3.0. If this numbers climbs up to 15.0 or 30.0 on a file, it indicates high SD card write latency, which may affect the reliability of recordings.
-- POOL_LEAKS: The number of audio core crashes. This should remain zero. This part contains 2 values, X,Y. X represents the number of audio core crashes that resulted in a lost audio block, and Y is the total number of blocks that have passed through the capture queue. Similar to OVERRUNS, a non-zero X indicates a slow or defective SD card. If you modify the DSP, POOL_LEAKS can also indicate high DSP overhead; this has not been observed with the default DSP configuration.
+- POOL_LEAKS: The number of audio core crashes. This should remain zero. This part contains 2 values, X,Y. X represents the number of audio core crashes that resulted in a lost audio block, and Y is the total number of blocks that have passed through the capture queue. Similar to OVERRUNS, a non-zero X indicates a slow or defective SD card. POOL_LEAKS can also indicate very high DSP overhead; this has not been observed with the default DSP configuration and range of parameters recommended in the code comments.
 
 ### Flashing/Compiling:
-I recommend using VSCode with the PlatformIO extension installed on your PC to compile and upload this code to your ESP32 board. Download and unzip this repo to your `Projects` folder. Use the "Open Project" button in PlatformIO home and select the `fpvgoggleaudiorecorderesp32-main` folder. Connect your esp32 to a USB port on your PC, and click the upload button to compile and upload the firmware to your ESP32 (right arrow button on the bottom bar in VSCode). Further details on setting up and using PlatformIO are beyond the scope this repo.
+I recommend using VSCode with the PlatformIO extension to compile and upload this code to your ESP32 board. Download and unzip this repo to your `Projects` folder. Use the "Open Project" button in PlatformIO home and select the `fpvgoggleaudiorecorderesp32-main` folder. Connect your esp32 to a USB port on your PC, and click the upload button to compile and upload the firmware to your ESP32 (right arrow button on the bottom bar in VSCode). Further details on setting up and using PlatformIO are beyond the scope this repo.
 
 ### Wiring:
 Connect the hardware together as shown in the table below.
@@ -104,3 +104,5 @@ Tidy wire routing is important as the enclosure is very compact. Silicone strand
 <img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/images/assembly1.jpg" width="600">
 
  First add a fillet of glue around the inside edges of the lens you pressed in earlier. Next glue the button into place; use a small amount at first to avoid squirt out that may interfere with operation. Hold the button firmly in position until the glue tacks up. Add glue to the rails where the ESP32 will sit, and press the ESP into the rails. Add a fillet of additional glue on top of the board where it touches the rails, and hold it in place until the glue tacks up. Repeat this procedure to glue the SD card in the bottom half of the case. Insert the mic into the top half of the case, adding a small amount of glue to the rails to prevent movement. Now snap the case halves together taking care not to pinch any wires. Finally, add a thick bead of glue around the bottom of the windscreen basket where it touches the box and install the windscreen, pressing it firmly down into the glue.
+
+<img src="https://github.com/truglodite/fpvGoggleAudioRecorderESP32/blob/main/images/assembly2.jpg" width="600">
