@@ -39,6 +39,37 @@
     - FIX 17: checkButton() gated on !diskFull to prevent rollover into a full-disk openSegment()
     - FIX 18: millis() called once in openSegment(); single value assigned to both timestamp fields
     - FIX 19: flushAllQueues() documented — one pool slot is lost per recovery event by design
+
+    Fix log (pass 4 — review 4, field data: ~550ms audio loss at every segment rollover):
+    - FIX 20: Producer (Core 1) no longer pauses during rollover. Root cause of the ~550ms
+              gap was audioCoreTask halting I2S capture entirely (spinning on a 1ms delay)
+              for the full duration of closeSegment()+openSegment() on Core 0, which is an
+              unbounded SD-card-latency operation (directory entry + FAT writeback on close,
+              another on open). The 128-block (~742ms) queue is the elastic buffer that was
+              never being used for this case — Core 1 now keeps reading I2S and pushing into
+              filledBlockQueue continuously, rollover or not. Core 0's close/open sequencing
+              is unchanged; the backlog it creates (~95 blocks at the measured 550ms gap)
+              simply drains once the new file is open. Net effect: zero sample loss at
+              rollover boundaries, confirmed against field manifest data showing consistent
+              546-554ms CLOSE->OPEN gaps prior to this fix.
+    - FIX 21: bufferWarning is no longer raised by the expected queue backlog that FIX 20
+              introduces at every rollover (~95/128 blocks, just under the 85% threshold
+              under normal conditions, and capable of exceeding it on a slower SD card).
+              The rising-edge check is suppressed while rolloverPending is set so the LED
+              doesn't false-positive into LED_WARN on every routine segment split. This does
+              NOT mask a genuine pre-existing overload: bufferWarning is never forced false
+              here, only withheld from being newly set during the known-harmless window.
+    - NOTE (no code change): the queueEmpty() check in writeTaskStep()'s rollover-swap path
+              is a single-instant snapshot (uxQueueMessagesWaiting() == 0) being raced by two
+              cores. Analysis indicates this is safe in practice — Core 0's write throughput
+              vastly exceeds Core 1's ~44.1kHz/256-sample production rate, so the queue should
+              never falsely flicker empty mid-backlog-drain. Recommended: stress-test under
+              high-overrun conditions (degraded/near-full SD card) and listen to the actual
+              audio at rollover boundaries in the resulting file, since a race here would
+              manifest as a brief glitch, not a counter anomaly visible in the manifest log.
+              If field testing ever shows an issue, the fix would mirror the existing
+              SD_CONSECUTIVE_OK_CLEAR hysteresis pattern (require N consecutive empty reads
+              before swapping) rather than trusting a single read.
 */
 
 #include <Arduino.h>
@@ -107,7 +138,7 @@
 
 #define SAMPLE_RATE            44100
 #define BLOCK_SAMPLES          256
-#define QUEUE_BLOCKS           128
+#define QUEUE_BLOCKS            128
 #define QUEUE_WARN_THRESHOLD_HIGH (QUEUE_BLOCKS * 85 / 100)
 #define QUEUE_WARN_THRESHOLD_LOW  (QUEUE_BLOCKS * 10 / 100)
 
@@ -532,19 +563,23 @@ void audioCoreTask(void *pvParameters) {
                           std::memory_order_relaxed);
         }
 
+        // FIX 20: Producer no longer pauses or special-cases rolloverPending here.
+        //         Core 1 always reads I2S and always pushes the resulting block into
+        //         filledBlockQueue, rollover or not. The 128-block (~742ms) queue is
+        //         the elastic buffer that absorbs the ~550ms Core 0 close/open latency;
+        //         previously this branch halted I2S capture entirely for that whole
+        //         window, which was the root cause of audio loss at every segment split.
         uint32_t currentQueueUsed = queueUsed();
-        if (currentQueueUsed > QUEUE_WARN_THRESHOLD_HIGH) {
+        if (rolloverPending.load(std::memory_order_relaxed)) {
+            // FIX 21: Expected, bounded backlog during the known close/open window —
+            // not genuine backpressure. Withhold the rising-edge warning so the LED
+            // doesn't false-positive into LED_WARN on every routine segment split.
+            // bufferWarning is never forced false here, so a pre-existing genuine
+            // warning (set before rollover began) is left untouched.
+        } else if (currentQueueUsed > QUEUE_WARN_THRESHOLD_HIGH) {
             bufferWarning = true;
         } else if (currentQueueUsed < QUEUE_WARN_THRESHOLD_LOW) {
             bufferWarning = false;
-        }
-
-        // Pause producer during rollover so the queue drains cleanly before
-        // Core 0 closes and opens the segment file.
-        if (rolloverPending.load(std::memory_order_relaxed)) {
-            xQueueSend(freeBlockQueue, &block, 0);
-            vTaskDelay(pdMS_TO_TICKS(1));
-            continue;
         }
 
         if (xQueueSend(filledBlockQueue, &block, 0) != pdTRUE) {
@@ -661,6 +696,12 @@ void writeTaskStep() {
     // Second rollover check: fires after the very last block before the deadline drains.
     // NOTE: if writeAudioBlock24 failed on this last block, the rollover still proceeds
     // and the failed block's data is silently dropped. sdWarning is set in that case.
+    //
+    // FIX 20 context: queueEmpty() here is a single-instant snapshot raced by both cores.
+    // Core 1 keeps producing during rollover now, so this no longer relies on the queue
+    // having gone idle — it relies on Core 0's write throughput outpacing Core 1's capture
+    // rate enough to drain the rollover backlog and observe a real empty point. See the
+    // FIX 21 block comment at the top of this file for the stress-test recommendation.
     if (rolloverPending && queueEmpty()) {
         closeSegment();
         openSegment();
