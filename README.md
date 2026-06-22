@@ -22,11 +22,11 @@
 - 6mm Momentary NO Tactile Button: https://www.amazon.com/Momentary-Tactile-Through-Breadboard-Friendly/dp/B07WF76VHT
 - 10mm Microphone Wind Screen: https://www.amazon.com/dp/B07BQ2LZDX
 
-* Note that almost any i2s mic (like INMP441) could be substituted in place of an ICS43434. The ICS mic is recommended as it has high dynamic range and sensitivity for the price point. Also the printed enclosure is designed to fit the above linked ICS mic board (square, not round style).
+    * Note that almost any i2s mic (like INMP441) could be substituted in place of an ICS43434. The ICS mic is recommended as it has high dynamic range and sensitivity for the price point. Also the printed enclosure is designed to fit the above linked ICS mic board (square, not round style).
 
-* I recommend removing the 4 resistors on the SD card board. Leaving the resistors on may cause problems with certain SD cards.
+    * I recommend removing the 4 resistors on the SD card board. Leaving the resistors on may cause problems with certain SD cards.
 
-* A high quality A2/U3 rated SD card is highly recommended for trouble free operation. Sandisk Extreme or Samsung Pro Plus have been tested and work well. The SD card must be in fat32 format. This type of SD card will usually come shipped with exFAT, which will not work.
+    * A high quality A2/U3 rated SD card is highly recommended for trouble free operation. Sandisk Extreme or Samsung Pro Plus have been tested and work well. The SD card must be in fat32 format. This type of SD card will usually come shipped with exFAT, which will not work.
 
 ### Operation
 Simply plug a USB-C to USB-C cable between the recorder and your goggle charging jack, and fly as usual. This has been tested with DJI goggles 1, 2, and 3. Fully automated recording should also work with any goggles that output 5V only while turned on.
