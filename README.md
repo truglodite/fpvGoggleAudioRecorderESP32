@@ -18,14 +18,12 @@
 *Prefer no pins installed if using the printable enclosure*
 - ESP32 S3 Super Mini Board: https://www.amazon.com/dp/B0GFDSK5RD
 - ICS43434 I2S Microphone Board: https://www.amazon.com/ICS43434-Microphone-Breakout-Module-Filter/dp/B0FMDGRM8F
+    * Note that almost any i2s mic (like INMP441) could be substituted in place of an ICS43434. The ICS mic is recommended as it has high dynamic range and sensitivity for the price point. Also the printed enclosure is designed to fit the above linked ICS mic board (square, not round style).
 - Micro SD Card Board (3.3V): https://www.amazon.com/WWZMDiB-Module-Adapter-Memory-Shield/dp/B0BV8ZQ81F
+    * I recommend removing the 4 resistors on the SD card board. Leaving the resistors on may cause problems with certain SD cards.
 - 6mm Momentary NO Tactile Button: https://www.amazon.com/Momentary-Tactile-Through-Breadboard-Friendly/dp/B07WF76VHT
 - 10mm Microphone Wind Screen: https://www.amazon.com/dp/B07BQ2LZDX
-
-    * Note that almost any i2s mic (like INMP441) could be substituted in place of an ICS43434. The ICS mic is recommended as it has high dynamic range and sensitivity for the price point. Also the printed enclosure is designed to fit the above linked ICS mic board (square, not round style).
-
-    * I recommend removing the 4 resistors on the SD card board. Leaving the resistors on may cause problems with certain SD cards.
-
+- SD card: https://www.amazon.com/dp/B07FCMBLV6
     * A high quality A2/U3 rated SD card is highly recommended for trouble free operation. Sandisk Extreme or Samsung Pro Plus have been tested and work well. The SD card must be in fat32 format. This type of SD card will usually come shipped with exFAT, which will not work.
 
 ### Operation
