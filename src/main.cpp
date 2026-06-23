@@ -14,62 +14,6 @@
     - Disk Writing, File Operations, and UI handling locked to Core 0 (PRO_CPU)
     - Format: RAW 24-bit PCM, Signed little-endian (3 Bytes per sample), 44100 Hz mono
     - Hardware Floating-Point Unit (FPU) Optimized DSP chain
-
-    Fix log (pass 1 — review 1):
-    - FIX 1:  dsp.env atomic read-modify-write race corrected (load + store separately)
-    - FIX 2:  writeAudioBlock24 seek uses pre-write position instead of post-write position
-    - FIX 3:  sdWarning uses consecutive-success hysteresis instead of clearing on any write
-    - FIX 4:  diskFull checks actual SD free space in addition to write-error count
-    - FIX 5:  checkCore1Health flushes both queues before restarting the audio task
-    - FIX 6:  globalPeak decay is now multiplicative (rate-independent)
-    - FIX 7:  segmentQueueSamples comparison uses explicit .load()
-    - FIX 8:  portMEMORY_BARRIER() removed; std::atomic semantics are sufficient
-
-    Fix log (pass 2 — review 2):
-    - FIX 9:  SD.usedBytes() throttled to once per 5 s; no longer called on every write error
-    - FIX 10: consecutiveOkWrites reset in openSegment() so hysteresis restarts per segment
-    - FIX 11: core1Heartbeat assignments use explicit .store() for consistency
-    - FIX 12: lastAudioMs promoted to std::atomic<uint32_t> (written Core 1, read Core 0)
-    - FIX 13: xQueueSend to freeBlockQueue on overrun path now checked; leaks counted
-
-    Fix log (pass 3 — review 3):
-    - FIX 14: checkSdFreeSpace() returns immediately if diskFull already set
-    - FIX 15: segmentStartMs marked volatile; prevents compiler caching across loop()
-    - FIX 16: All SystemHealth counters promoted to std::atomic; increments use fetch_add
-    - FIX 17: checkButton() gated on !diskFull to prevent rollover into a full-disk openSegment()
-    - FIX 18: millis() called once in openSegment(); single value assigned to both timestamp fields
-    - FIX 19: flushAllQueues() documented — one pool slot is lost per recovery event by design
-
-    Fix log (pass 4 — review 4, field data: ~550ms audio loss at every segment rollover):
-    - FIX 20: Producer (Core 1) no longer pauses during rollover. Root cause of the ~550ms
-              gap was audioCoreTask halting I2S capture entirely (spinning on a 1ms delay)
-              for the full duration of closeSegment()+openSegment() on Core 0, which is an
-              unbounded SD-card-latency operation (directory entry + FAT writeback on close,
-              another on open). The 128-block (~742ms) queue is the elastic buffer that was
-              never being used for this case — Core 1 now keeps reading I2S and pushing into
-              filledBlockQueue continuously, rollover or not. Core 0's close/open sequencing
-              is unchanged; the backlog it creates (~95 blocks at the measured 550ms gap)
-              simply drains once the new file is open. Net effect: zero sample loss at
-              rollover boundaries, confirmed against field manifest data showing consistent
-              546-554ms CLOSE->OPEN gaps prior to this fix.
-    - FIX 21: bufferWarning is no longer raised by the expected queue backlog that FIX 20
-              introduces at every rollover (~95/128 blocks, just under the 85% threshold
-              under normal conditions, and capable of exceeding it on a slower SD card).
-              The rising-edge check is suppressed while rolloverPending is set so the LED
-              doesn't false-positive into LED_WARN on every routine segment split. This does
-              NOT mask a genuine pre-existing overload: bufferWarning is never forced false
-              here, only withheld from being newly set during the known-harmless window.
-    - NOTE (no code change): the queueEmpty() check in writeTaskStep()'s rollover-swap path
-              is a single-instant snapshot (uxQueueMessagesWaiting() == 0) being raced by two
-              cores. Analysis indicates this is safe in practice — Core 0's write throughput
-              vastly exceeds Core 1's ~44.1kHz/256-sample production rate, so the queue should
-              never falsely flicker empty mid-backlog-drain. Recommended: stress-test under
-              high-overrun conditions (degraded/near-full SD card) and listen to the actual
-              audio at rollover boundaries in the resulting file, since a race here would
-              manifest as a brief glitch, not a counter anomaly visible in the manifest log.
-              If field testing ever shows an issue, the fix would mirror the existing
-              SD_CONSECUTIVE_OK_CLEAR hysteresis pattern (require N consecutive empty reads
-              before swapping) rather than trusting a single read.
 */
 
 #include <Arduino.h>
@@ -101,35 +45,35 @@
 // Release Speed (True Alpha): How smoothly volume fades back up to capture background noise.
 // [Recommended Range: 0.005f (Very Slow) to 0.050f (Very Fast)]
 // - 0.005f (~3-4 sec recovery): Slow, professional broadcast-style level gliding.
-// - 0.015f (~1-2 sec recovery): Sweet spot. Background tracks up naturally between sentences.
+// - 0.015f (~1-2 sec recovery): Sweet spot. Background tracks up naturally between sentences. (default)
 // - 0.050f (~200ms recovery): Fast pumping. Background noise rushes up between words.
 #define DSP_RELEASE_COEFF 0.015f
 
 // Threshold (dB): Audio levels above this are compressed down.
 // [Recommended Range: -50.0f to -20.0f]
 // - -20.0f: Standard peak limiter. Only affects your voice when you actively shout.
-// - -40.0f: Sweet spot for AGC. Squashes normal voice so makeup gain lifts the background.
+// - -40.0f: Sweet spot for AGC. Squashes normal voice so makeup gain lifts the background. (default)
 // - -50.0f: Extreme sensitivity. Will start compressing ambient room noise and floor hiss.
-#define DSP_COMP_THRESHOLD_DB -40.0f
+#define DSP_COMP_THRESHOLD_DB -50.0f
 
 // Ratio: How aggressively loud audio is squashed above the threshold.
 // [Recommended Range: 2.0f to 20.0f]
 // - 2.0f: Gentle leveling. Sounds natural, but loud shouts might still clip.
-// - 5.0f: Standard AGC ratio. Keeps vocal tracking relatively flat.
+// - 5.0f: Standard AGC ratio. Keeps vocal tracking relatively flat. (default)
 // - 20.0f: Hard brickwall limiting. Absolute volume ceiling; can sound crushed/distorted.
 #define DSP_COMP_RATIO 5.0f
 
 // Makeup Gain (dB): The volume boost applied to the entire signal after compression.
-// [Recommended Range: 10.0f to 40.0f]
+// [Recommended Range: 10.0f to 40.0f, default = 30]
 // - 10.0f: Subtle boost. Good if you only care about your own voice.
 // - 30.0f: Sweet spot. Pulls distant conversations up to sound nearby.
 // - 40.0f: Extreme gain. Silent field sounds like a wall of white noise.
-#define DSP_MAKEUP_GAIN_DB 30.0f
+#define DSP_MAKEUP_GAIN_DB 41.0f
 
 // Absolute brickwall limit to prevent 24-bit integer overflow/wrap-around.
 // [Recommended Range: 8000000.0f to 8388600.0f]
 // - Do not exceed 8388607.0f (theoretical 24-bit max).
-// - 8300000.0f leaves a safety margin against digital wrap-around pops.
+// - Default 8300000.0f leaves a safety margin against digital wrap-around pops.
 #define DSP_LIMIT_MAX 8300000.0f
 
 // ======================================================
@@ -145,12 +89,8 @@
 #define SEGMENT_MS             120000UL
 #define FLUSH_INTERVAL_MS      1000UL   // Must be <= SD_SPACE_CHECK_MS
 
-// FIX 3: Consecutive successful writes required to clear sdWarning (hysteresis).
 #define SD_CONSECUTIVE_OK_CLEAR 16
 
-// FIX 9: SD free-space is checked at most once per SD_SPACE_CHECK_MS.
-//        SD.usedBytes() is a slow FAT call; never call it in the write hot-path.
-//        Keep SD_SPACE_CHECK_MS >= FLUSH_INTERVAL_MS to avoid redundant FS calls.
 #define SD_FREE_BYTES_MIN  (64ULL * 1024 * 1024)   // ~64 MB safety margin
 #define SD_SPACE_CHECK_MS  5000UL
 
@@ -229,8 +169,6 @@ std::atomic<uint32_t> segmentQueueSamples{0};
 // FIX 10: File-scope so openSegment() can reset it at every segment boundary.
 uint32_t consecutiveOkWrites = 0;
 
-// FIX 16: All counters promoted to std::atomic so Core 1 increments are safe.
-//         Increments use fetch_add(1, relaxed) — ordering not required for diagnostics.
 struct SystemHealth {
     std::atomic<uint32_t> bufferOverruns{0};
     std::atomic<uint32_t> i2sTimeouts{0};
@@ -406,7 +344,6 @@ void openSegment() {
     audioFile = SD.open(currentFilename, FILE_WRITE);
     if (!audioFile) fatalError();
 
-    // FIX 18: Single millis() call — both timestamps are guaranteed identical.
     uint32_t now      = millis();
     segmentStartMs    = now;
     lastFileSplitMs   = now;
@@ -416,7 +353,6 @@ void openSegment() {
     segmentQueueSum.store(0, std::memory_order_relaxed);
     segmentQueueSamples.store(0, std::memory_order_relaxed);
 
-    // FIX 10: Reset hysteresis at segment boundary — sdWarning re-arms for the new file.
     consecutiveOkWrites = 0;
 
     logEvent("OPEN", currentFilename);
@@ -470,7 +406,6 @@ void audioCoreTask(void *pvParameters) {
     int32_t rawSamples[BLOCK_SAMPLES];
 
     while (1) {
-        // FIX 11: Explicit .store() — consistent with all other heartbeat write sites.
         core1Heartbeat.store(millis(), std::memory_order_relaxed);
 
         if (!recording) {
@@ -557,25 +492,13 @@ void audioCoreTask(void *pvParameters) {
                 limiterActive.store(true, std::memory_order_relaxed);
             }
 
-            // FIX 1: Separate load + store — prevents non-atomic RMW on the atomic.
             float prevEnv = dsp.env.load(std::memory_order_relaxed);
             dsp.env.store(0.9f * prevEnv + 0.1f * maxProcessedBlockVal,
                           std::memory_order_relaxed);
         }
 
-        // FIX 20: Producer no longer pauses or special-cases rolloverPending here.
-        //         Core 1 always reads I2S and always pushes the resulting block into
-        //         filledBlockQueue, rollover or not. The 128-block (~742ms) queue is
-        //         the elastic buffer that absorbs the ~550ms Core 0 close/open latency;
-        //         previously this branch halted I2S capture entirely for that whole
-        //         window, which was the root cause of audio loss at every segment split.
         uint32_t currentQueueUsed = queueUsed();
         if (rolloverPending.load(std::memory_order_relaxed)) {
-            // FIX 21: Expected, bounded backlog during the known close/open window —
-            // not genuine backpressure. Withhold the rising-edge warning so the LED
-            // doesn't false-positive into LED_WARN on every routine segment split.
-            // bufferWarning is never forced false here, so a pre-existing genuine
-            // warning (set before rollover began) is left untouched.
         } else if (currentQueueUsed > QUEUE_WARN_THRESHOLD_HIGH) {
             bufferWarning = true;
         } else if (currentQueueUsed < QUEUE_WARN_THRESHOLD_LOW) {
@@ -583,7 +506,6 @@ void audioCoreTask(void *pvParameters) {
         }
 
         if (xQueueSend(filledBlockQueue, &block, 0) != pdTRUE) {
-            // FIX 13 / FIX 16: Check the fallback send; count any unrecoverable leak.
             if (xQueueSend(freeBlockQueue, &block, 0) != pdTRUE) {
                 sys.poolLeaks.fetch_add(1, std::memory_order_relaxed);
             }
@@ -630,10 +552,6 @@ bool writeAudioBlock24(AudioBlock &block) {
     return false;
 }
 
-// FIX 9 / FIX 14: Throttled SD free-space check.
-//   - SD.usedBytes() is a slow FAT layer call; never run it in the write hot-path.
-//   - FIX 14: Returns immediately if diskFull is already set — avoids redundant FS calls
-//     during the one loop() iteration between diskFull being set and fatalError() firing.
 void checkSdFreeSpace() {
     if (diskFull) return;                                    // FIX 14
     static uint32_t lastSpaceCheckMs = 0;
@@ -648,13 +566,10 @@ void checkSdFreeSpace() {
 void writeTaskStep() {
     static uint32_t lastFlush = 0;
 
-    // FIX 15: segmentStartMs is volatile — read is not cached across iterations.
     if (!rolloverPending && (millis() - segmentStartMs >= SEGMENT_MS)) {
         rolloverPending = true;
-        // FIX 8: std::atomic store provides the required memory fence; no barrier needed.
     }
 
-    // FIX 9: Periodic space check, fully decoupled from the write-error path.
     checkSdFreeSpace();
 
     AudioBlock *block = NULL;
@@ -673,13 +588,11 @@ void writeTaskStep() {
         consecutiveOkWrites = 0;   // FIX 3: Reset hysteresis on any error
         sdWarning = true;
 
-        // FIX 4: Sustained-error threshold; space-exhaustion lives in checkSdFreeSpace().
         if (sys.sdErrors.load(std::memory_order_relaxed) > 10) {
             diskFull = true;
         }
     } else {
         sys.writes.fetch_add(1, std::memory_order_relaxed);  // FIX 16
-        // FIX 3: Clear sdWarning only after SD_CONSECUTIVE_OK_CLEAR clean writes in a row.
         if (++consecutiveOkWrites >= SD_CONSECUTIVE_OK_CLEAR) {
             sdWarning = false;
         }
@@ -696,12 +609,6 @@ void writeTaskStep() {
     // Second rollover check: fires after the very last block before the deadline drains.
     // NOTE: if writeAudioBlock24 failed on this last block, the rollover still proceeds
     // and the failed block's data is silently dropped. sdWarning is set in that case.
-    //
-    // FIX 20 context: queueEmpty() here is a single-instant snapshot raced by both cores.
-    // Core 1 keeps producing during rollover now, so this no longer relies on the queue
-    // having gone idle — it relies on Core 0's write throughput outpacing Core 1's capture
-    // rate enough to drain the rollover backlog and observe a real empty point. See the
-    // FIX 21 block comment at the top of this file for the stress-test recommendation.
     if (rolloverPending && queueEmpty()) {
         closeSegment();
         openSegment();
@@ -725,9 +632,6 @@ void checkButton() {
         if (reading != buttonState) {
             buttonState = reading;
             if (buttonState == LOW) {
-                // FIX 17: Gate on !diskFull — triggering a rollover when the disk is full
-                //         would call openSegment() → SD.open() → likely fatalError() from
-                //         inside the rollover path rather than cleanly from loop().
                 if (recording && !rolloverPending && !diskFull) {
                     Serial.println(">>> MANUAL SPLIT REQUESTED <<<");
                     rolloverPending = true;
@@ -762,12 +666,6 @@ void initAudioHardware() {
     if (i2s_set_pin(I2S_NUM, &pin_config) != ESP_OK) fatalError();
 }
 
-// FIX 5: Drains stale filled blocks back to the free pool before restarting the audio
-//        task, so pre-crash and post-recovery audio are never interleaved in the file.
-// FIX 19: KNOWN LIMITATION — if the audio task was killed while holding a block (i.e.
-//         mid-DSP with a block dequeued but not yet sent anywhere), that slot is lost.
-//         One pool slot leaks per recovery event. With QUEUE_BLOCKS = 128, 128 stalls
-//         are required before pool exhaustion becomes a real concern.
 void flushAllQueues() {
     AudioBlock *block = NULL;
     while (xQueueReceive(filledBlockQueue, &block, 0) == pdTRUE) {
@@ -800,7 +698,6 @@ void printStats() {
     if ((millis() - lastPrint) < 5000) return;
     lastPrint = millis();
 
-    // FIX 16: All counters are now atomic; .load() for consistent snapshot reads.
     Serial.printf("writes=%u overruns=%u i2s=%u sd=%u queued=%u leaks=%u\n",
                   sys.writes.load(std::memory_order_relaxed),
                   sys.bufferOverruns.load(std::memory_order_relaxed),
