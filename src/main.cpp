@@ -94,12 +94,13 @@
 #define SD_FREE_BYTES_MIN  (64ULL * 1024 * 1024)   // ~64 MB safety margin
 #define SD_SPACE_CHECK_MS  5000UL
 
+// Pin numbers for wiring
 #define SD_MISO            1
 #define SD_MOSI            2
 #define SD_SCK             3
 #define SD_CS              10
 
-#define RGB_LED_PIN        48
+#define RGB_LED_PIN        48  // Built-in LED
 #define BUTTON_PIN         7
 
 #define I2S_BCLK_PIN       5
