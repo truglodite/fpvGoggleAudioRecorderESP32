@@ -28,28 +28,31 @@
 // DSP & AGC (AUTOMATIC GAIN CONTROL) CONFIGURATION
 // ======================================================
 
-// High-Pass Filter: Prevents wind/breath rumble from falsely triggering the compressor.
-// [Recommended Range: 0.980f to 0.995f]
-// - 0.995f (~35Hz cut): Good for general audio, but lets wind rumble through.
-// - 0.988f (~80Hz cut): Standard vocal mic cutoff. Blocks breath plosives.
-// - 0.980f (~140Hz cut): Extreme wind reduction, but makes voices sound "thin" or tinny.
-#define DSP_HPF_COEFF 0.988f
+// High-Pass Filter cutoff frequency in Hz.
+// The alpha coefficient is derived as expf(-2π·fc/fs) — exact 1st-order RC HPF.
+// [Recommended Range: 35.0f to 140.0f Hz]
+// - 35.0f:  Very gentle cut (~0.995 alpha). Lets wind rumble through.
+// - 85.0f:  Standard vocal mic cutoff. Blocks breath plosives. (matches original 0.988)
+// - 140.0f: Aggressive wind reduction. Voices sound thin/tinny above this.
+#define DSP_HPF_HZ 85.0f
 
-// Attack Speed (True Alpha): How fast the system clamps down on sudden loud peaks.
-// [Recommended Range: 0.500f (Slower) to 0.990f (Brickwall)]
-// - 0.990f: Instant clamping. Catches aggressive transients but can sound slightly clicky.
-// - 0.900f: Sweet spot for vocal limiting. Fast enough to prevent clipping without artifacts.
-// - 0.500f: Relaxed attack. Lets quick claps or sharp shouts pass through uncompressed.
-#define DSP_ATTACK_COEFF 0.900f
+// Envelope follower attack time constant in seconds (how fast gain clamps on loud peaks).
+// The alpha is derived as expf(-1/(tau · block_rate)) where block_rate = SAMPLE_RATE/BLOCK_SAMPLES.
+// [Recommended Range: 0.005f to 0.200f seconds]
+// - 0.005f (~5ms):   Near-instant clamping. Catches hard transients, can sound clicky.
+// - 0.055f (~55ms):  Original behavior (was alpha=0.900). Natural vocal limiting.
+// - 0.200f (~200ms): Slow attack. Lets sharp peaks through before clamping.
+#define DSP_ATTACK_S 0.055f
 
-// Release Speed (True Alpha): How smoothly volume fades back up to capture background noise.
-// [Recommended Range: 0.005f (Very Slow) to 0.050f (Very Fast)]
-// - 0.005f (~3-4 sec recovery): Slow, professional broadcast-style level gliding.
-// - 0.015f (~1-2 sec recovery): Sweet spot. Background tracks up naturally between sentences. (default)
-// - 0.050f (~200ms recovery): Fast pumping. Background noise rushes up between words.
-#define DSP_RELEASE_COEFF 0.015f
+// Envelope follower release time constant in seconds (how fast gain recovers after a peak).
+// [Recommended Range: 0.0001f to 4.000f seconds]
+// - 0.0014f (~1.4ms): Instant recovery. Background noise snaps up instantly between words.
+// - 1.500f (~1.5s):  Sweet spot. Background tracks up naturally between sentences.
+// - 4.000f (~4s):    Slow broadcast-style glide. Very stable but slow to chase level drops.
+#define DSP_RELEASE_S 0.0014f
 
 // Threshold (dB): Audio levels above this are compressed down.
+// Lower values make quieter noises louder.
 // [Recommended Range: -50.0f to -20.0f]
 // - -20.0f: Standard peak limiter. Only affects your voice when you actively shout.
 // - -40.0f: Sweet spot for AGC. Squashes normal voice so makeup gain lifts the background. (default)
@@ -64,17 +67,23 @@
 #define DSP_COMP_RATIO 5.0f
 
 // Makeup Gain (dB): The volume boost applied to the entire signal after compression.
-// [Recommended Range: 10.0f to 40.0f, default = 30]
+// Decreasing threshold or increasing ratio will require increasing makeup gain.
+// [Recommended Range: 10.0f to 60.0f, default = 30]
 // - 10.0f: Subtle boost. Good if you only care about your own voice.
 // - 30.0f: Sweet spot. Pulls distant conversations up to sound nearby.
 // - 40.0f: Extreme gain. Silent field sounds like a wall of white noise.
-#define DSP_MAKEUP_GAIN_DB 41.0f
+#define DSP_MAKEUP_GAIN_DB 49.0f
 
 // Absolute brickwall limit to prevent 24-bit integer overflow/wrap-around.
 // [Recommended Range: 8000000.0f to 8388600.0f]
 // - Do not exceed 8388607.0f (theoretical 24-bit max).
 // - Default 8300000.0f leaves a safety margin against digital wrap-around pops.
 #define DSP_LIMIT_MAX 8300000.0f
+
+// Compile time pre-calculations
+#define DSP_HPF_COEFF expf(-2.0f * (float)M_PI * DSP_HPF_HZ / (float)SAMPLE_RATE)
+#define DSP_ATTACK_COEFF expf(-1.0f / ((float)SAMPLE_RATE / (float)BLOCK_SAMPLES * DSP_ATTACK_S))
+#define DSP_RELEASE_COEFF expf(-1.0f / ((float)SAMPLE_RATE / (float)BLOCK_SAMPLES * DSP_RELEASE_S))
 
 // ======================================================
 // SYSTEM CONFIGURATION
